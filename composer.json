@@ -1,0 +1,28 @@
+{
+    "name": "soroux/job-monitor",
+    "description": "A package to monitor Laravel Redis queues via an API.",
+    "type": "laravel-package",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "soroux",
+            "email": "sorosh.ganjuee@email.com"
+        }
+    ],
+    "require": {
+        "php": "^8.1",
+        "illuminate/support": "^9.0|^10.0|^11.0|^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Soroux\\JobMonitor\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Soroux\\JobMonitor\\Providers\\JobMonitorServiceProvider"
+            ]
+        }
+    }
+}
