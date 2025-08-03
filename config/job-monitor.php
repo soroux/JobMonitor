@@ -23,6 +23,15 @@ return [
         'processing',
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Redis Connection Name
+    |--------------------------------------------------------------------------
+    |
+    | Specify the Redis connection name to use for the job monitoring package.
+    |
+    */
+    'monitor-connection' => env('JOB_MONITOR_REDIS_CONNECTION', 'default'),
 
     /*
     |--------------------------------------------------------------------------
@@ -36,6 +45,23 @@ return [
     'monitoring' => [
         'commands_enabled' => true,
         'job_correlation_enabled' => true,
+    ],
+
+    /*
+   |--------------------------------------------------------------------------
+   | Exception Handling Configuration
+   |--------------------------------------------------------------------------
+   |
+   | Control how exceptions are logged, including stack trace depth.
+   |
+   */
+    'exceptions' => [
+        /*
+        | Number of stack frames to include in exception logs
+        | Set to 0 to disable stack traces completely
+        | Recommended: 3-5 frames for production
+        */
+        'frame_count' => 3,
     ],
     /*
     | Commands to Ignore

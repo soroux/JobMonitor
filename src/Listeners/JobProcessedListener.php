@@ -46,8 +46,8 @@ class JobProcessedListener
         $key = "command:{$processId}:jobs";
 
         try {
-            $redis = Redis::connection();
-            
+            $redis = Redis::connection(config('job-monitor.monitor-connection'));
+
             // Calculate execution time with fallback
             $startedAt = $job->jobStartedAt ?? microtime(true);
             $duration = microtime(true) - $startedAt;
@@ -68,7 +68,7 @@ class JobProcessedListener
 
             $redis->hset($key, $jobId, json_encode($jobData));
             $redis->expire($key, config('job-monitor.completed_ttl', 3600));
-            
+
             Log::info("[JobMonitor] Job {$jobId} completed successfully with process ID {$processId}");
         } catch (\Exception $e) {
             Log::error("[JobMonitor] Failed to mark job {$jobId} as completed. Error: {$e->getMessage()}");

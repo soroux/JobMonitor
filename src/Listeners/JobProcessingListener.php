@@ -47,8 +47,8 @@ class JobProcessingListener
         $key = "command:{$processId}:jobs";
 
         try {
-            $redis = Redis::connection();
-            
+            $redis = Redis::connection(config('job-monitor.monitor-connection'));
+
             // Mark job as started for timing calculations
             $job->markJobStarted();
 
@@ -64,7 +64,7 @@ class JobProcessingListener
 
             $redis->hset($key, $jobId, json_encode($jobData));
             $redis->expire($key, config('job-monitor.tracking_ttl', 86400));
-            
+
             Log::info("[JobMonitor] Job {$jobId} started processing with process ID {$processId}");
         } catch (\Exception $e) {
             Log::error("[JobMonitor] Failed updating job {$jobId}. Error: {$e->getMessage()}");

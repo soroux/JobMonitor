@@ -12,7 +12,7 @@ class LogCommandStarting
 
     public function __construct()
     {
-        $this->redis = Redis::connection();
+        $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
     }
 
     public function handle(CommandStarting $event): void
@@ -24,7 +24,7 @@ class LogCommandStarting
         $key = 'commands:running';
         // Use a unique ID for each command instance
         $processId = Str::uuid()->toString();
-        
+
         // Create a unique key for this command instance
         $commandInstanceKey = "command-instance:{$event->command}:" . time() . ":" . Str::random(8);
 
@@ -40,10 +40,10 @@ class LogCommandStarting
 
         try {
             $this->redis->hset($key, $processId, $payload);
-            
+
             // Store the process ID with the unique instance key
             $this->redis->setex($commandInstanceKey, 3600, $processId);
-            
+
             // Also store with command name for backward compatibility (but with shorter TTL)
             $this->redis->setex("command-pid-map:{$event->command}", 300, $processId);
 

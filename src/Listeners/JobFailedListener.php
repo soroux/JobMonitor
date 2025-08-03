@@ -47,8 +47,8 @@ class JobFailedListener
         $key = "command:{$processId}:jobs";
 
         try {
-            $redis = Redis::connection();
-            
+            $redis = Redis::connection(config('job-monitor.monitor-connection'));
+
             // Calculate execution time if job was started
             $executionTime = null;
             if ($job->jobStartedAt) {
@@ -59,7 +59,16 @@ class JobFailedListener
                 'status'      => 'failed',
                 'failed_at'   => now()->toDateTimeString(),
                 'error'       => $event->exception->getMessage(),
-                'stack_trace' => $event->exception->getTraceAsString(),
+                'stack_trace' =>array_map(
+                    function ($frame) {
+                        return [
+                            'file' => $frame['file'] ?? '[internal]',
+                            'line' => $frame['line'] ?? 0,
+                            'call' => ($frame['class'] ?? '') . ($frame['type'] ?? '') . $frame['function']
+                        ];
+                    },
+                    array_slice($event->exception->getTrace(), 0, config('job-monitor.exceptions.frame_count', 1))
+                ),
                 'attempts'    => $event->job->attempts(),
                 'job_type'    => $job->jobType ?? null,
                 'queue'       => $event->job->getQueue(),
@@ -73,7 +82,7 @@ class JobFailedListener
             $redis->expire($key, config('job-monitor.failed_ttl', 172800));
 
             $this->handleFailure($event, $jobData);
-            
+
             Log::error("[JobMonitor] Job {$jobId} failed with process ID {$processId}: {$event->exception->getMessage()}");
         } catch (\Exception $e) {
             Log::error("[JobMonitor] Failed recording failure for job {$jobId}. Error: {$e->getMessage()}");

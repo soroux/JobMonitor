@@ -3,6 +3,7 @@
 namespace Soroux\JobMonitor\Http\Controllers;
 
 use Illuminate\Http\JsonResponse;
+use Illuminate\Redis\Connections\Connection;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -11,11 +12,11 @@ use Illuminate\Http\Request;
 
 class JobMonitorController extends Controller
 {
-    protected $redis;
+    private Connection $monitorRedis;
 
     public function __construct(Redis $redis)
     {
-        $this->redis = $redis::connection();
+        $this->monitorRedis = $redis::connection(config('job-monitor.monitor-connection'));
     }
 
     public function stats(): JsonResponse
@@ -23,11 +24,45 @@ class JobMonitorController extends Controller
         $queues = config('job-monitor.queues', ['default']);
         $stats = [];
 
+        // Get all keys with the specified pattern
+        $keys = $this->monitorRedis->keys("command:*:jobs");
+        $client = $this->monitorRedis->client();
+        $prefix = $client->getOption(\Redis::OPT_PREFIX);
+        $statusCounts = [];
+
+        foreach ($keys as $key) {
+            // Check if the key starts with the prefix and remove it
+            if (strpos($key, $prefix) === 0) {
+                $jobKey = substr($key, strlen($prefix)); // Remove the prefix
+            } else {
+                // If the prefix is not at the start, skip this key
+                continue;
+            }
+
+            $jobs = $this->monitorRedis->hgetall($jobKey); // Use the jobKey without prefix
+
+            foreach ($jobs as $jobData) {
+                $data = json_decode($jobData, true);
+                $queue = $data['queue'] ?? 'default';
+                $status = $data['status'] ?? 'unknown';
+
+                if (!in_array($queue, $queues)) {
+                    continue;
+                }
+
+                if (!isset($statusCounts[$queue][$status])) {
+                    $statusCounts[$queue][$status] = 0;
+                }
+
+                $statusCounts[$queue][$status]++;
+            }
+        }
+
         foreach ($queues as $queue) {
             $stats[$queue] = [
-                'pending' => $this->redis->llen("queues:{$queue}"),
-                'processing' => $this->redis->zcard("queues:{$queue}:reserved"),
-                'delayed' => $this->redis->zcard("queues:{$queue}:delayed"),
+                'pending' => $statusCounts[$queue]['pending'] ?? 0,
+                'processing' => $statusCounts[$queue]['processing'] ?? 0,
+                'failed' => DB::table('failed_jobs')->where('queue', $queue)->count(),
             ];
         }
 
@@ -77,7 +112,7 @@ class JobMonitorController extends Controller
     public function runningCommands(): JsonResponse
     {
         try {
-            $running = $this->redis->hgetall('commands:running');
+            $running = $this->monitorRedis->hgetall('commands:running');
         } catch (\Exception $e) {
             return response()->json(['status' => 'error', 'message' => 'Could not retrieve running commands.'], 500);
         }
@@ -95,7 +130,7 @@ class JobMonitorController extends Controller
     public function finishedCommands(): JsonResponse
     {
         try {
-            $running = $this->redis->hgetall('commands:finished');
+            $running = $this->monitorRedis->hgetall('commands:finished');
         } catch (\Exception $e) {
             return response()->json(['status' => 'error', 'message' => 'Could not retrieve running commands.'], 500);
         }
@@ -114,18 +149,16 @@ class JobMonitorController extends Controller
     {
         $key = "command:{$processId}:jobs";
 
-        if (!$this->redis->exists($key)) {
+        if (!$this->monitorRedis->exists($key)) {
             return response()->json(['status' => 'error', 'message' => 'Command process not found or data has expired.'], 404);
         }
 
-        $jobs = $this->redis->hgetall($key);
-        $failedJobDetails = DB::table('failed_jobs')->whereIn('uuid', array_keys($jobs))->get()->keyBy('uuid');
+        $jobs = $this->monitorRedis->hgetall($key);
 
-        $results = collect($jobs)->map(function ($status, $id) use ($failedJobDetails) {
+        $results = collect($jobs)->map(function ($status, $id) {
             return [
                 'id' => $id,
                 'status' => $status,
-                'failed_details' => $failedJobDetails->get($id),
             ];
         })->values();
 
@@ -135,7 +168,7 @@ class JobMonitorController extends Controller
     public function retryFailedCommandJobs(string $processId): JsonResponse
     {
         $key = "command:{$processId}:jobs";
-        $jobs = $this->redis->hgetall($key);
+        $jobs = $this->monitorRedis->hgetall($key);
 
         $failedJobIds = collect($jobs)->filter(fn($status) => json_decode($status)->status === 'failed')->keys();
 
@@ -157,7 +190,7 @@ class JobMonitorController extends Controller
                 'queue' => $decoded->queue ?? 'default',
                 'job_class' => $decoded->job_class ?? null,
             ];
-            $this->redis->hset($key, $id, json_encode($jobData));
+            $this->monitorRedis->hset($key, $id, json_encode($jobData));
         }
 
         return response()->json(['status' => 'success', 'message' => 'Retry command dispatched for all failed jobs.']);

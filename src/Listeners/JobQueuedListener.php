@@ -39,17 +39,17 @@ class JobQueuedListener
 
         // Ensure we have a process ID (auto-generates if null)
         $processId = $job->generateProcessId();
-        
+
         if (!$processId) {
             Log::error("[JobMonitor] Failed to generate process ID for job {$jobId}");
             return;
         }
 
         $key = "command:{$processId}:jobs";
-        
+
         try {
-            $redis = Redis::connection();
-            
+            $redis = Redis::connection(config('job-monitor.monitor-connection'));
+
             $jobData = [
                 'status' => 'pending',
                 'created_at' => now()->toDateTimeString(),
@@ -61,7 +61,7 @@ class JobQueuedListener
 
             $redis->hset($key, $jobId, json_encode($jobData));
             $redis->expire($key, config('job-monitor.tracking_ttl', 86400));
-            
+
             Log::info("[JobMonitor] Job {$jobId} queued with process ID {$processId}");
         } catch (\Exception $e) {
             Log::error("[JobMonitor] Failed tracking job {$jobId}. Error: {$e->getMessage()}");

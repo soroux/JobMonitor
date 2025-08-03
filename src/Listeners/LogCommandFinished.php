@@ -11,7 +11,7 @@ class LogCommandFinished
 
     public function __construct()
     {
-        $this->redis = Redis::connection();
+        $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
     }
 
     public function handle(CommandFinished $event): void
