@@ -9,6 +9,14 @@ use Soroux\JobMonitor\Concerns\TrackableJob;
 
 class JobQueuedListener
 {
+
+    protected $redis;
+
+    public function __construct()
+    {
+        $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
+    }
+
     public function handle(JobQueued $event): void
     {
         // Early return if queue is not monitored
@@ -40,6 +48,9 @@ class JobQueuedListener
         // Ensure we have a process ID (auto-generates if null)
         $processId = $job->generateProcessId();
 
+        // Ensure we have a process name (auto-generates if null)
+        $commandName = $job->generateCommandName();
+
         if (!$processId) {
             Log::error("[JobMonitor] Failed to generate process ID for job {$jobId}");
             return;
@@ -48,23 +59,41 @@ class JobQueuedListener
         $key = "command:{$processId}:jobs";
 
         try {
-            $redis = Redis::connection(config('job-monitor.monitor-connection'));
 
             $jobData = [
                 'status' => 'pending',
-                'created_at' => now()->toDateTimeString(),
+                'created_at' => microtime(true),
                 'job_type' => $job->jobType ?? null,
                 'process_id' => $processId,
+                'command_name' => $commandName,
                 'queue' => $event->queue ?? 'default',
                 'job_class' => get_class($job)
             ];
+            if (config('job-monitor.analyze_mode.enabled')) {
+                $this->analyzeJob($event, $jobData);
+            }
 
-            $redis->hset($key, $jobId, json_encode($jobData));
-            $redis->expire($key, config('job-monitor.tracking_ttl', 86400));
+            $this->redis->hset($key, $jobId, json_encode($jobData));
+            $this->redis->expire($key, config('job-monitor.tracking_ttl', 86400));
 
             Log::info("[JobMonitor] Job {$jobId} queued with process ID {$processId}");
         } catch (\Exception $e) {
             Log::error("[JobMonitor] Failed tracking job {$jobId}. Error: {$e->getMessage()}");
         }
+    }
+
+    public function analyzeJob(JobQueued $event, array $jobData): void
+    {
+        if ($jobData['command_name'] == 'manual-dispatch'){
+            return;
+        }
+
+        $commandName = $jobData['command_name'];
+        $processId = $jobData['process_id'];
+
+        // Update command metrics
+        $commandKey = "command:metrics:{$commandName}:{$processId}";
+        $this->redis->hincrby($commandKey, 'job_count', 1);
+        $this->redis->hset($commandKey, 'last_update', now()->toDateTimeString());
     }
 }

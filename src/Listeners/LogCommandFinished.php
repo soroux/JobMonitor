@@ -28,6 +28,7 @@ class LogCommandFinished
                 $this->redis->hset('commands:finished', $processId, json_encode([
                     'id' => $processId,
                     'command' => $event->command,
+                    'source' => app()->runningInConsole() ? 'console' : 'api',
                     'finished_at' => now()->toDateTimeString(),
                     'exit_code' => $event->exitCode,
                 ]));

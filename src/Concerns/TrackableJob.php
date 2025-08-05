@@ -10,6 +10,7 @@ trait TrackableJob
      * Unique identifier for the command process chain
      */
     public ?string $commandProcessId = null;
+    public ?string $commandName = null;
 
     /**
      * Timestamp when job was created
@@ -37,6 +38,26 @@ trait TrackableJob
 
         $this->commandProcessId = $id ?: $this->generateProcessId();
         return $this;
+    }
+
+    /**
+     * Sets the process name from the parent command
+     */
+    public function setCommandName(?string $name): self
+    {
+        $this->commandName = $name;
+        return $this;
+    }
+
+    /**
+     * Generates a new process name if none exists
+     */
+    public function generateCommandName(): string
+    {
+        if (empty($this->commandName)) {
+            $this->commandName = 'manual-dispatch';
+        }
+        return $this->commandName;
     }
 
     /**

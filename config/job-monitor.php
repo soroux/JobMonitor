@@ -80,7 +80,11 @@ return [
         'queue:forget',
         'tinker',
         'serve',
+        'migrate',
         'queue:work',
+        'metrics:sync',
+        'job-monitor:analyze',
+        'schedule:run',
         null, // <-- Sometimes command is null (for tests or internal calls)
     ],
 
@@ -104,4 +108,79 @@ return [
     | Default: 48 hours (172800 seconds)
     */
     'failed_ttl' => 172800,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Job Analyze Mode
+    |--------------------------------------------------------------------------
+    |
+    | If enabled, the package will analyze jobs and commands
+    |
+    */
+    'analyze_mode' => [
+        'enabled' => env('JOB_MONITOR_ANALYZE', true),
+        'retention_days' => 7,
+        'performance_threshold' => 1.5, // 1.5x historical average
+        'failed_jobs_threshold' => 2.0, // 2x historical average failed jobs
+        'job_count_threshold' => 1.5, // 1.5x historical average job count
+        'analysis_interval_minutes' => 15, // How often to run analysis
+        'schedule_analysis_enabled' => true, // Analyze scheduled commands
+        'missed_execution_threshold_hours' => 2, // Hours to wait before considering a command as missed
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | API-Triggered Commands Monitoring
+    |--------------------------------------------------------------------------
+    |
+    | Specify commands that are expected to be triggered via API (Artisan::call)
+    | and the expected interval (in minutes) between calls. Used for anomaly detection.
+    |
+    */
+    'api_commands' => [
+        // 'your:api-command' => 60, // e.g. 'my:api-command' => 60 (every hour)
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Notification Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure how anomalies are notified to your team.
+    |
+    */
+    'notifications' => [
+        'email' => [
+            'enabled' => env('JOB_MONITOR_EMAIL_NOTIFICATIONS', false),
+            'recipients' => [
+                // Add email addresses here
+                // 'admin@example.com',
+                // 'devops@example.com',
+            ],
+        ],
+        'slack' => [
+            'enabled' => env('JOB_MONITOR_SLACK_NOTIFICATIONS', false),
+            'webhook_url' => env('JOB_MONITOR_SLACK_WEBHOOK_URL'),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Redis-to-Database Sync Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure how metrics are synced from Redis to database
+    |
+    */
+    'sync' => [
+        'enabled' => env('JOB_MONITOR_SYNC_ENABLED', true),
+        'interval_minutes' => env('JOB_MONITOR_SYNC_INTERVAL', 5), // How often to sync
+        'batch_size' => env('JOB_MONITOR_SYNC_BATCH_SIZE', 500), // Batch size for database inserts
+        'retry_attempts' => env('JOB_MONITOR_SYNC_RETRY_ATTEMPTS', 3), // Retry failed syncs
+        'retry_delay_seconds' => env('JOB_MONITOR_SYNC_RETRY_DELAY', 30), // Delay between retries
+        'cleanup_enabled' => env('JOB_MONITOR_CLEANUP_ENABLED', true), // Clean up old Redis data
+        'cleanup_after_hours' => env('JOB_MONITOR_CLEANUP_AFTER_HOURS', 24), // Keep Redis data for X hours
+        'max_memory_mb' => env('JOB_MONITOR_MAX_MEMORY_MB', 100), // Max memory usage for sync process
+        'timeout_seconds' => env('JOB_MONITOR_SYNC_TIMEOUT', 300), // Max execution time for sync
+    ],
 ];

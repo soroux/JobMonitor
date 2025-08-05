@@ -9,6 +9,13 @@ use Soroux\JobMonitor\Concerns\TrackableJob;
 
 class JobFailedListener
 {
+    protected $redis;
+
+    public function __construct()
+    {
+        $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
+    }
+
     public function handle(JobFailed $event): void
     {
         // Early return if queue is not monitored
@@ -38,6 +45,7 @@ class JobFailedListener
         }
 
         $processId = $job->commandProcessId ?? null;
+        $commandName = $job->commandName ?? null;
 
         if (!$processId) {
             Log::warning("[JobMonitor] Job {$jobId} failed without process ID");
@@ -47,19 +55,20 @@ class JobFailedListener
         $key = "command:{$processId}:jobs";
 
         try {
-            $redis = Redis::connection(config('job-monitor.monitor-connection'));
+            $oldData = $this->redis->hget($key, $jobId);
+            $oldData = json_decode($oldData, true);
 
-            // Calculate execution time if job was started
-            $executionTime = null;
-            if ($job->jobStartedAt) {
-                $executionTime = microtime(true) - $job->jobStartedAt;
-            }
+            $startedAt = $oldData['started_at'] ?? microtime(true);
+            $duration = microtime(true) - $startedAt;
+            $queueTime = $oldData['queue_time'] ?? 0;
+
+            $totalTime = $duration + $queueTime;
 
             $jobData = [
-                'status'      => 'failed',
-                'failed_at'   => now()->toDateTimeString(),
-                'error'       => $event->exception->getMessage(),
-                'stack_trace' =>array_map(
+                'status' => 'failed',
+                'failed_at' => now()->toDateTimeString(),
+                'error' => $event->exception->getMessage(),
+                'stack_trace' => array_map(
                     function ($frame) {
                         return [
                             'file' => $frame['file'] ?? '[internal]',
@@ -69,19 +78,21 @@ class JobFailedListener
                     },
                     array_slice($event->exception->getTrace(), 0, config('job-monitor.exceptions.frame_count', 1))
                 ),
-                'attempts'    => $event->job->attempts(),
-                'job_type'    => $job->jobType ?? null,
-                'queue'       => $event->job->getQueue(),
-                'job_class'   => get_class($job),
-                'execution_time' => $executionTime ? round($executionTime, 4) : null,
-                'retryable'   => method_exists($event->exception, 'report'),
+                'process_id' => $processId,
+                'command_name' => $commandName,
+                'job_type' => $job->jobType ?? null,
+                'queue' => $event->job->getQueue(),
+                'job_class' => get_class($job),
+                'execution_time' => $duration ? round($duration, 4) : null,
+                'total_time' => round($totalTime, 4),
+                'queue_time' => round($queueTime, 4),
                 'exception_class' => get_class($event->exception)
             ];
 
-            $redis->hset($key, $jobId, json_encode($jobData));
-            $redis->expire($key, config('job-monitor.failed_ttl', 172800));
+            $this->redis->hset($key, $jobId, json_encode($jobData));
+            $this->redis->expire($key, config('job-monitor.failed_ttl', 172800));
 
-            $this->handleFailure($event, $jobData);
+            $this->handleFailure($event, $jobData, $jobId);
 
             Log::error("[JobMonitor] Job {$jobId} failed with process ID {$processId}: {$event->exception->getMessage()}");
         } catch (\Exception $e) {
@@ -89,9 +100,41 @@ class JobFailedListener
         }
     }
 
-    protected function handleFailure(JobFailed $event, array $jobData): void
+    protected function handleFailure(JobFailed $event, array $jobData, $jobId): void
     {
-        // Optional: send notification, update DB, etc.
-        // You can implement notifications, database logging, or other failure handling here
+        if (config('job-monitor.analyze_mode.enabled')) {
+            $this->analyzeJob($event, $jobData, $jobId);
+        }
+    }
+
+    public function analyzeJob(JobFailed $event, array $jobData, $jobId): void
+    {
+        $peakMemoryUsage = memory_get_peak_usage(true);
+
+
+        if ($jobData['command_name'] == 'manual-dispatch') {
+
+            // Store job metrics
+            $this->redis->hmset("job:metrics:{$jobId}", [
+                'execution_time' => $jobData['execution_time'],
+                'process_id' => $jobData['process_id'],
+                'memory_usage' => $peakMemoryUsage,
+                'queue_time' => $jobData['queue_time'],
+                'command_name' => $jobData['command_name'],
+                'status' => 'failed',
+                'timestamp' => now()->toDateTimeString()
+            ]);
+        }
+        if ($jobData['command_name'] !== 'manual-dispatch') {
+
+            // Update command metrics
+            $commandKey = "command:metrics:{$jobData['command_name']}:{$jobData['process_id']}";
+            $this->redis->hincrby($commandKey, 'failed_jobs', 1);
+            $this->redis->hincrbyfloat($commandKey, 'total_job_time', $jobData['execution_time']);
+            $this->redis->hset($commandKey, 'peak_memory',
+                max($this->redis->hget($commandKey, 'peak_memory'), $peakMemoryUsage)
+            );
+            $this->redis->hset($commandKey, 'last_update', now()->toDateTimeString());
+        }
     }
 }

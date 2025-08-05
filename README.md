@@ -1,456 +1,371 @@
-# Laravel Job Monitor
+# Job Monitor Package
 
-A comprehensive Laravel package for monitoring and tracking queue jobs and Artisan commands in real-time. This package provides detailed insights into job execution, command correlation, and failure tracking with a clean REST API.
+A comprehensive Laravel package for monitoring job and command performance with intelligent anomaly detection.
 
 ## Features
 
-- 🔍 **Real-time Job Monitoring**: Track job lifecycle from queuing to completion
-- 🎯 **Command-Job Correlation**: Link jobs to the Artisan commands that dispatched them
-- 📊 **Comprehensive Statistics**: Queue statistics, failed jobs, and execution metrics
-- 🚨 **Failure Tracking**: Detailed error logging with stack traces and retry information
-- ⚡ **Performance Metrics**: Queue time, execution time, and total processing time
-- 🔧 **REST API**: Clean API endpoints for monitoring and management
-- 🎨 **Easy Integration**: Simple trait-based implementation
-- 🔒 **Production Ready**: Robust error handling and logging
+### Data Collection
+- **Command Tracking**: Monitors all Artisan commands execution
+- **Job Correlation**: Links jobs to their parent commands
+- **Performance Metrics**: Tracks execution time, memory usage, and job counts
+- **Failure Tracking**: Monitors failed jobs and their patterns
 
-## Requirements
+### Intelligent Analysis
+- **Performance Anomalies**: Detects commands taking longer than usual
+- **Failure Rate Analysis**: Identifies commands with unusually high failure rates
+- **Job Count Anomalies**: Detects unusual job processing volumes
+- **Missed Executions**: Identifies scheduled commands that didn't run
+- **Historical Comparison**: Uses historical data for baseline comparison
 
-- PHP 8.1+
-- Laravel 9.0+ / 10.0+ / 11.0+ / 12.0+
-- Redis (for data storage)
-- Queue driver (Redis, Database, etc.)
+### Notifications
+- **Email Notifications**: Configurable email alerts
+- **Slack Integration**: Real-time Slack notifications
+- **Logging**: Comprehensive logging of all anomalies
 
 ## Installation
 
-### 1. Install the Package
-
+1. Install the package:
 ```bash
 composer require soroux/job-monitor
 ```
 
-### 2. Publish Configuration
-
+2. Publish the configuration:
 ```bash
-php artisan vendor:publish --provider="Soroux\JobMonitor\Providers\JobMonitorServiceProvider" --tag=config
+php artisan vendor:publish --tag=job-monitor-config
 ```
 
-### 3. Configure Redis
+3. Run migrations:
+```bash
+php artisan migrate
+```
 
-Ensure your Redis connection is properly configured in `config/database.php`:
-
-```php
-'redis' => [
-    'default' => [
-        'host' => env('REDIS_HOST', '127.0.0.1'),
-        'password' => env('REDIS_PASSWORD', null),
-        'port' => env('REDIS_PORT', 6379),
-        'database' => env('REDIS_DB', 0),
-    ],
-],
+4. Set up the analysis schedule:
+```bash
+php artisan job-monitor:setup-schedule
 ```
 
 ## Configuration
 
-The configuration file `config/job-monitor.php` contains all package settings:
+### Basic Configuration
+
+Edit `config/job-monitor.php`:
 
 ```php
-return [
-    /*
-    | API Route Prefix
-    | All routes will be prefixed with this value.
-    */
-    'prefix' => 'api/job-monitor',
+'analyze_mode' => [
+    'enabled' => true,
+    'retention_days' => 7,
+    'performance_threshold' => 1.5, // 1.5x historical average
+    'failed_jobs_threshold' => 2.0, // 2x historical average failed jobs
+    'job_count_threshold' => 1.5, // 1.5x historical average job count
+    'analysis_interval_minutes' => 15, // How often to run analysis
+    'schedule_analysis_enabled' => true, // Analyze scheduled commands
+    'missed_execution_threshold_hours' => 2, // Hours to wait before considering a command as missed
+],
+```
 
-    /*
-    | API Route Middleware
-    | The middleware to apply to the routes.
-    | IMPORTANT: Protect these routes with auth middleware in production!
-    */
-    'middleware' => ['api'],
+### Notification Configuration
 
-    /*
-    | Queues to Monitor
-    | An array of queue names you want to monitor.
-    */
-    'queues' => [
-        'default',
-        'notifications',
-        'processing',
+```php
+'notifications' => [
+    'email' => [
+        'enabled' => env('JOB_MONITOR_EMAIL_NOTIFICATIONS', false),
+        'recipients' => [
+            'admin@example.com',
+            'devops@example.com',
+        ],
     ],
-
-    /*
-    | Command Monitoring
-    | If enabled, the package will listen for command events to track
-    | which Artisan commands are currently running.
-    */
-    'monitoring' => [
-        'commands_enabled' => true,
-        'job_correlation_enabled' => true,
+    'slack' => [
+        'enabled' => env('JOB_MONITOR_SLACK_NOTIFICATIONS', false),
+        'webhook_url' => env('JOB_MONITOR_SLACK_WEBHOOK_URL'),
     ],
+],
+```
 
-    /*
-    | Commands to Ignore
-    | An array of command signatures to ignore when monitoring.
-    | You might want to ignore frequent, short-lived commands.
-    */
-    'ignore_commands' => [
-        'schedule:run',
-        'schedule:finish',
-        'package:discover',
-        'vendor:publish',
-        'config:cache',
-        'queue:retry',
-        'queue:forget',
-        'tinker',
-        'serve',
-        'queue:work',
-        null, // Sometimes command is null (for tests or internal calls)
-    ],
+### Environment Variables
 
-    /*
-    | Redis TTL Settings (in seconds)
-    */
-    'tracking_ttl' => 86400,    // 24 hours for pending/processing jobs
-    'completed_ttl' => 3600,    // 1 hour for completed jobs
-    'failed_ttl' => 172800,     // 48 hours for failed jobs
-];
+Add to your `.env` file:
+
+```env
+JOB_MONITOR_ANALYZE=true
+JOB_MONITOR_EMAIL_NOTIFICATIONS=true
+JOB_MONITOR_SLACK_NOTIFICATIONS=false
+JOB_MONITOR_SLACK_WEBHOOK_URL=your-slack-webhook-url
 ```
 
 ## Usage
 
-### 1. Make Your Jobs Trackable
+### Manual Analysis
 
-Add the `TrackableJob` trait to your job classes:
+Run analysis manually:
 
-```php
-<?php
+```bash
+# Analyze all commands
+php artisan job-monitor:analyze
 
-namespace App\Jobs;
-
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Queue\Queueable;
-use Soroux\JobMonitor\Concerns\TrackableJob;
-
-class ProcessOrderJob implements ShouldQueue
-{
-    use Queueable, TrackableJob;
-
-    public function __construct(
-        private int $orderId,
-        private string $customerEmail
-    ) {
-        $this->setJobType('order_processing')
-             ->markJobCreated();
-    }
-
-    public function handle(): void
-    {
-        // Your job logic here
-        $this->processOrder($this->orderId);
-        $this->sendNotification($this->customerEmail);
-    }
-}
+# Analyze specific command
+php artisan job-monitor:analyze --command=queue:work
 ```
 
-### 2. Correlate Jobs with Commands
+### Scheduled Analysis
 
-In your Artisan commands, link jobs to the command process:
+The package automatically sets up scheduled analysis. Make sure your Laravel scheduler is running:
 
-```php
-<?php
-
-namespace App\Console\Commands;
-
-use App\Jobs\ProcessOrderJob;
-use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Redis;
-
-class ProcessOrdersCommand extends Command
-{
-    protected $signature = 'orders:process {--batch-size=100}';
-    protected $description = 'Process pending orders';
-
-    public function handle(): void
-    {
-        // Get the process ID for this command instance
-        $processId = $this->getCommandProcessId();
-        
-        $this->info("Starting order processing with Process ID: {$processId}");
-
-        $orders = Order::pending()->take($this->option('batch-size'))->get();
-
-        foreach ($orders as $order) {
-            $job = (new ProcessOrderJob($order->id, $order->customer_email))
-                ->setCommandProcessId($processId)
-                ->setJobType('order_processing')
-                ->markJobCreated();
-
-            dispatch($job);
-            
-            $this->info("Dispatched job for order #{$order->id}");
-        }
-
-        $this->info('Finished dispatching order processing jobs.');
-    }
-
-    private function getCommandProcessId(): string
-    {
-        // Try to get from Redis first (if command was started with monitoring)
-        $processId = Redis::connection()->get("command-pid-map:{$this->getName()}");
-        
-        if (!$processId) {
-            // Generate a new process ID if not found
-            $processId = (string) Str::uuid();
-        }
-        
-        return $processId;
-    }
-}
+```bash
+php artisan schedule:work
 ```
 
-### 3. Monitor Job Progress
+### Anomaly Types
 
-Use the API to monitor job progress:
+The system detects the following anomalies:
+
+1. **Performance Anomaly**: Command taking longer than threshold × average time
+2. **Failed Jobs Anomaly**: Command with more failed jobs than threshold × average
+3. **High Job Count**: Command processing more jobs than usual
+4. **Low Job Count**: Command processing fewer jobs than usual
+5. **Missed Execution**: Scheduled command that didn't run when expected
+6. **Never Executed**: Scheduled command that has never run
+
+### Event Handling
+
+Listen for anomaly events:
 
 ```php
-// Get all jobs for a specific command process
-$response = Http::get('/api/job-monitor/commands/{processId}/jobs');
-$jobs = $response->json()['data'];
+use Soroux\JobMonitor\Events\PerformanceAnomalyDetected;
 
-foreach ($jobs as $job) {
-    echo "Job {$job['id']}: {$job['status']}\n";
-}
+Event::listen(PerformanceAnomalyDetected::class, function ($event) {
+    // Handle the anomaly
+    Log::warning('Anomaly detected', [
+        'command' => $event->commandName,
+        'type' => $event->anomalyType,
+        'details' => $event->details
+    ]);
+});
 ```
 
 ## API Endpoints
 
-### Queue Statistics
+### Get Command Metrics
 
 ```http
-GET /api/job-monitor/stats
+GET /api/job-monitor/commands
 ```
 
-**Response:**
-```json
+### Get Job Metrics
+
+```http
+GET /api/job-monitor/jobs
+```
+
+### Get Performance Analysis
+
+```http
+GET /api/job-monitor/analysis
+```
+
+## Commands
+
+### Available Commands
+
+- `job-monitor:analyze` - Run performance analysis
+- `job-monitor:setup-schedule` - Set up analysis schedule
+- `job-monitor:setup-sync-schedule` - Set up metrics sync schedule
+- `metrics:sync` - Sync metrics to database
+
+### Sync Command Options
+
+```bash
+# Basic sync
+php artisan metrics:sync
+
+# Force sync even if disabled
+php artisan metrics:sync --force
+
+# Dry run (show what would be synced without actually syncing)
+php artisan metrics:sync --dry-run
+
+# Set up sync schedule (every 5 minutes by default)
+php artisan job-monitor:setup-sync-schedule
+
+# Set up sync schedule with custom interval
+php artisan job-monitor:setup-sync-schedule --interval=10
+```
+
+## Redis-to-Database Sync
+
+### Configuration
+
+The sync system is highly configurable through `config/job-monitor.php`:
+
+```php
+'sync' => [
+    'enabled' => env('JOB_MONITOR_SYNC_ENABLED', true),
+    'interval_minutes' => env('JOB_MONITOR_SYNC_INTERVAL', 5),
+    'batch_size' => env('JOB_MONITOR_SYNC_BATCH_SIZE', 500),
+    'retry_attempts' => env('JOB_MONITOR_SYNC_RETRY_ATTEMPTS', 3),
+    'retry_delay_seconds' => env('JOB_MONITOR_SYNC_RETRY_DELAY', 30),
+    'cleanup_enabled' => env('JOB_MONITOR_CLEANUP_ENABLED', true),
+    'cleanup_after_hours' => env('JOB_MONITOR_CLEANUP_AFTER_HOURS', 24),
+    'max_memory_mb' => env('JOB_MONITOR_MAX_MEMORY_MB', 100),
+    'timeout_seconds' => env('JOB_MONITOR_SYNC_TIMEOUT', 300),
+],
+```
+
+### Environment Variables
+
+Add to your `.env` file:
+
+```env
+# Sync Configuration
+JOB_MONITOR_SYNC_ENABLED=true
+JOB_MONITOR_SYNC_INTERVAL=5
+JOB_MONITOR_SYNC_BATCH_SIZE=500
+JOB_MONITOR_SYNC_RETRY_ATTEMPTS=3
+JOB_MONITOR_SYNC_RETRY_DELAY=30
+JOB_MONITOR_CLEANUP_ENABLED=true
+JOB_MONITOR_CLEANUP_AFTER_HOURS=24
+JOB_MONITOR_MAX_MEMORY_MB=100
+JOB_MONITOR_SYNC_TIMEOUT=300
+```
+
+### Features
+
+- **Configurable Intervals**: Sync every 1, 5, 10, 15, 30 minutes, hourly, or custom
+- **Batch Processing**: Configurable batch sizes for optimal performance
+- **Memory Management**: Automatic memory limit enforcement
+- **Timeout Protection**: Prevents sync from running indefinitely
+- **Error Handling**: Comprehensive error logging and retry logic
+- **Progress Tracking**: Real-time progress bars and statistics
+- **Data Validation**: Validates metrics before database insertion
+- **Cleanup**: Automatic cleanup of old Redis data
+- **Dry Run Mode**: Test sync without making changes
+
+### Monitoring
+
+The sync process provides detailed statistics:
+
+```
+=== Sync Statistics ===
+Execution time: 2.34 seconds
+Memory usage: 45.2MB
+Commands synced: 150
+Jobs synced: 1250
+Errors: 0
+Warnings: 2
+```
+
+### Troubleshooting
+
+#### Common Issues
+
+1. **Sync not running**: Check if `php artisan schedule:work` is running
+2. **Memory errors**: Reduce `JOB_MONITOR_SYNC_BATCH_SIZE` or increase `JOB_MONITOR_MAX_MEMORY_MB`
+3. **Timeout errors**: Increase `JOB_MONITOR_SYNC_TIMEOUT`
+4. **Redis connection errors**: Check Redis configuration and connectivity
+
+#### Debug Commands
+
+```bash
+# Test sync with dry run
+php artisan metrics:sync --dry-run
+
+# Force sync with verbose output
+php artisan metrics:sync --force -v
+
+# Check Redis data
+php artisan tinker
+>>> Redis::keys('command:metrics:*')
+>>> Redis::keys('job:metrics:*')
+```
+
+## Database Schema
+
+### Command Metrics Table
+
+```sql
+CREATE TABLE command_metrics (
+    id BIGINT PRIMARY KEY,
+    process_id VARCHAR(255),
+    command_name VARCHAR(255),
+    total_time FLOAT,
+    job_count INT,
+    success_jobs INT,
+    failed_jobs INT,
+    avg_job_time FLOAT,
+    peak_memory INT,
+    run_date DATE,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+```
+
+### Job Metrics Table
+
+```sql
+CREATE TABLE job_metrics (
+    id BIGINT PRIMARY KEY,
+    job_id VARCHAR(255),
+    process_id VARCHAR(255),
+    command_name VARCHAR(255),
+    execution_time FLOAT,
+    memory_usage INT,
+    queue_time FLOAT,
+    status ENUM('success', 'failed'),
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+```
+
+## Customization
+
+### Custom Anomaly Detection
+
+Extend the `PerformanceAnalyzer` class:
+
+```php
+use Soroux\JobMonitor\Service\PerformanceAnalyzer;
+
+class CustomPerformanceAnalyzer extends PerformanceAnalyzer
 {
-    "status": "success",
-    "data": {
-        "total_failed": 5,
-        "queues": {
-            "default": {
-                "pending": 10,
-                "processing": 2,
-                "delayed": 0
-            },
-            "notifications": {
-                "pending": 5,
-                "processing": 1,
-                "delayed": 0
-            }
-        }
+    protected function checkCustomAnomaly($commandName)
+    {
+        // Your custom anomaly detection logic
     }
 }
 ```
 
-### Running Commands
+### Custom Notifications
 
-```http
-GET /api/job-monitor/commands/running
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "data": [
-        {
-            "id": "550e8400-e29b-41d4-a716-446655440000",
-            "command": "orders:process",
-            "started_at": "2024-01-15 10:30:00",
-            "environment": "production",
-            "arguments": [],
-            "options": {
-                "batch-size": "100"
-            }
-        }
-    ]
-}
-```
-
-### Finished Commands
-
-```http
-GET /api/job-monitor/commands/finished
-```
-
-### Command Jobs
-
-```http
-GET /api/job-monitor/commands/{processId}/jobs
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "data": [
-        {
-            "id": "job-uuid-1",
-            "status": {
-                "status": "completed",
-                "completed_at": "2024-01-15 10:35:00",
-                "execution_time": 2.5,
-                "total_time": 3.2,
-                "queue_time": 0.7,
-                "job_type": "order_processing",
-                "queue": "default",
-                "job_class": "App\\Jobs\\ProcessOrderJob",
-                "attempts": 1
-            }
-        },
-        {
-            "id": "job-uuid-2",
-            "status": {
-                "status": "failed",
-                "failed_at": "2024-01-15 10:36:00",
-                "error": "Database connection failed",
-                "stack_trace": "...",
-                "attempts": 3,
-                "job_type": "order_processing",
-                "queue": "default",
-                "job_class": "App\\Jobs\\ProcessOrderJob",
-                "execution_time": 1.2,
-                "retryable": true,
-                "exception_class": "Illuminate\\Database\\QueryException"
-            }
-        }
-    ]
-}
-```
-
-### Failed Jobs
-
-```http
-GET /api/job-monitor/jobs/failed?per_page=20&page=1
-```
-
-### Retry Failed Job
-
-```http
-POST /api/job-monitor/jobs/failed/{id}/retry
-```
-
-### Delete Failed Job
-
-```http
-DELETE /api/job-monitor/jobs/failed/{id}
-```
-
-### Retry All Failed Jobs for Command
-
-```http
-POST /api/job-monitor/commands/{processId}/retry-failed
-```
-
-## Job Status Types
-
-Jobs can have the following statuses:
-
-- **`pending`**: Job is queued and waiting to be processed
-- **`processing`**: Job is currently being executed
-- **`completed`**: Job finished successfully
-- **`failed`**: Job failed with an exception
-
-## Job Data Structure
-
-Each job entry contains:
-
-```json
-{
-    "status": "completed",
-    "created_at": "2024-01-15 10:30:00",
-    "started_at": "2024-01-15 10:30:05",
-    "completed_at": "2024-01-15 10:30:08",
-    "execution_time": 2.5,
-    "queue_time": 0.7,
-    "total_time": 3.2,
-    "job_type": "order_processing",
-    "queue": "default",
-    "job_class": "App\\Jobs\\ProcessOrderJob",
-    "process_id": "550e8400-e29b-41d4-a716-446655440000",
-    "attempts": 1
-}
-```
-
-## Security Considerations
-
-### 1. API Protection
-
-In production, protect your monitoring API with authentication:
+Create custom notification listeners:
 
 ```php
-// In config/job-monitor.php
-'middleware' => ['api', 'auth:sanctum'],
+use Soroux\JobMonitor\Events\PerformanceAnomalyDetected;
+
+class CustomAnomalyListener
+{
+    public function handle(PerformanceAnomalyDetected $event)
+    {
+        // Your custom notification logic
+    }
+}
 ```
-
-### 2. Redis Security
-
-Ensure your Redis instance is properly secured:
-- Use strong passwords
-- Enable SSL/TLS if possible
-- Restrict network access
-- Use dedicated Redis database
-
-### 3. Rate Limiting
-
-Consider adding rate limiting to your API endpoints:
-
-```php
-'middleware' => ['api', 'auth:sanctum', 'throttle:60,1'],
-```
-
-## Performance Considerations
-
-### 1. TTL Management
-
-Adjust TTL settings based on your needs:
-- Shorter TTL for completed jobs (1 hour)
-- Longer TTL for failed jobs (48 hours)
-- Moderate TTL for tracking data (24 hours)
-
-### 2. Queue Monitoring
-
-Only monitor queues you actually use to reduce overhead.
-
-### 3. Command Filtering
-
-Add frequently run commands to the ignore list to reduce noise.
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Jobs not being tracked**
-   - Ensure your job class uses the `TrackableJob` trait
-   - Check that the queue is in the monitored queues list
-   - Verify Redis connection is working
+1. **Analysis not running**: Ensure `php artisan schedule:work` is running
+2. **No data collected**: Check that the service provider is registered
+3. **Notifications not working**: Verify configuration and credentials
 
-2. **Process ID not found**
-   - Make sure the command is not in the ignore list
-   - Check that command monitoring is enabled
-   - Verify the command was started with monitoring
+### Debug Commands
 
-3. **Redis connection errors**
-   - Check Redis configuration
-   - Ensure Redis service is running
-   - Verify network connectivity
+```bash
+# Check if analysis is working
+php artisan job-monitor:analyze --verbose
 
-### Debug Mode
-
-Enable debug logging in your `.env`:
-
-```env
-LOG_LEVEL=debug
+# View collected metrics
+php artisan tinker
+>>> Soroux\JobMonitor\Models\CommandMetric::latest()->first()
 ```
 
 ## Contributing
@@ -463,12 +378,4 @@ LOG_LEVEL=debug
 
 ## License
 
-This package is open-sourced software licensed under the [MIT license](LICENSE).
-
-## Support
-
-For support, please open an issue on GitHub or contact the maintainer.
-
----
-
-**Made with ❤️ for the Laravel community** 
+This package is open-sourced software licensed under the [MIT license](LICENSE). 

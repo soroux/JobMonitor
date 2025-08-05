@@ -2,6 +2,7 @@
 
 namespace Soroux\JobMonitor\Providers;
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -11,12 +12,16 @@ use Illuminate\Support\ServiceProvider;
 use Illuminate\Console\Events\CommandFinished;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Support\Facades\Event;
+use Soroux\JobMonitor\Console\Commands\PerformanceAnalyzerCommand;
+use Soroux\JobMonitor\Console\Commands\SyncMetricsToDatabase;
 use Soroux\JobMonitor\Listeners\JobFailedListener;
 use Soroux\JobMonitor\Listeners\JobProcessedListener;
 use Soroux\JobMonitor\Listeners\JobProcessingListener;
 use Soroux\JobMonitor\Listeners\JobQueuedListener;
 use Soroux\JobMonitor\Listeners\LogCommandFinished;
 use Soroux\JobMonitor\Listeners\LogCommandStarting;
+use Soroux\JobMonitor\Listeners\PerformanceAnomalyListener;
+use Soroux\JobMonitor\Events\PerformanceAnomalyDetected;
 
 class JobMonitorServiceProvider extends ServiceProvider
 {
@@ -40,6 +45,34 @@ class JobMonitorServiceProvider extends ServiceProvider
 
         // Register event listeners
         $this->registerEventListeners();
+
+        // Register package migrations
+        $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
+        // Register performance analysis commands
+        $this->commands([
+            SyncMetricsToDatabase::class,
+            PerformanceAnalyzerCommand::class,
+        ]);
+
+        // Register sync command with configurable schedule
+        if (config('job-monitor.sync.enabled')) {
+
+            $this->app->booted(function () {
+                $schedule = $this->app->make(Schedule::class);
+
+                $intervalSyncMinutes = config('job-monitor.sync.interval_minutes', 5);
+                // Schedule sync based on interval
+                $schedule->command('metrics:sync')->cron("*/{$intervalSyncMinutes} * * * *");
+
+                if (config('job-monitor.analyze_mode.enabled')) {
+                    $intervalAnalyzeMinutes = config('job-monitor.analyze_mode.analysis_interval_minutes', 15);
+                    // Schedule analysis schedule based on interval
+                    $schedule->command('job-monitor:analyze')->cron("*/{$intervalAnalyzeMinutes} * * * *");
+                }
+
+            });
+        }
+
     }
 
     /**
@@ -101,6 +134,11 @@ class JobMonitorServiceProvider extends ServiceProvider
                 JobProcessed::class => JobProcessedListener::class,
                 JobFailed::class => JobFailedListener::class,
             ]);
+        }
+
+        // Register performance anomaly listener
+        if (config('job-monitor.analyze_mode.enabled')) {
+            Event::listen(PerformanceAnomalyDetected::class, PerformanceAnomalyListener::class);
         }
     }
 
