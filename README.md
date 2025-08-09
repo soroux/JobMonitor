@@ -239,7 +239,7 @@ Note: Some endpoints return `success: true|false` while others return `status: '
         }
       ]
     },
-    "metrics": [/* CommandMetric[] (same shape as above) */],
+    "metrics": [],
     "period": {
       "start_date": "2025-07-27T00:00:00Z",
       "end_date": "2025-08-03T12:00:00Z",
@@ -297,7 +297,7 @@ Note: Some endpoints return `success: true|false` while others return `status: '
   "from": 1,
   "last_page": 5,
   "last_page_url": "https://your.app/api/job-monitor/jobs/failed?page=5",
-  "links": [/* ... */],
+  "links": [],
   "next_page_url": "https://your.app/api/job-monitor/jobs/failed?page=2",
   "path": "https://your.app/api/job-monitor/jobs/failed",
   "per_page": 20,
@@ -336,8 +336,8 @@ Errors return 404 with:
       "source": "console",
       "started_at": "2025-08-03 11:58:00",
       "environment": "production",
-      "arguments": { /* ... */ },
-      "options": { /* ... */ }
+      "arguments": { },
+      "options": { }
     }
   ]
 }
