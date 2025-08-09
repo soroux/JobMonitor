@@ -14,7 +14,7 @@ class JobQueuedListener
 
     public function __construct()
     {
-        $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
+        $this->redis = Redis::connection(config('job-monitor.redis.connection', 'default'));
     }
 
     public function handle(JobQueued $event): void

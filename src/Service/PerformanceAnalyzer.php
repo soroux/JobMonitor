@@ -2,252 +2,526 @@
 
 namespace Soroux\JobMonitor\Service;
 
-use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\DB;
 use Soroux\JobMonitor\Events\PerformanceAnomalyDetected;
 use Soroux\JobMonitor\Models\CommandMetric;
+use Soroux\JobMonitor\Models\JobMetric;
+use Exception;
 use Carbon\Carbon;
-use Illuminate\Console\Scheduling\Schedule;
 
 class PerformanceAnalyzer
 {
-    /**
-     * Analyze all commands for performance anomalies
-     */
-    public function analyzeAllCommands()
+    private $config;
+
+    public function __construct()
     {
-        $commands = CommandMetric::select('command_name')
-            ->distinct()
-            ->where('run_date', '>=', now()->subDays(config('job-monitor.analyze_mode.retention_days')))
-            ->pluck('command_name');
-
-        foreach ($commands as $commandName) {
-            $this->analyzeCommand($commandName);
-        }
-
-        // Check for missed scheduled commands
-        if (config('job-monitor.analyze_mode.schedule_analysis_enabled')) {
-            $this->checkMissedScheduledCommands();
-        }
-        // Check for missed API-triggered commands
-        $this->checkMissedApiCommands();
+        $this->config = config('job-monitor.analyze_mode');
     }
 
     /**
-     * Analyze a specific command for all types of anomalies
+     * Analyze performance and detect anomalies
+     *
+     * @return array
+     * @throws Exception
      */
-    public function analyzeCommand($commandName)
+    public function analyze(): array
     {
-        $this->checkPerformanceAnomaly($commandName);
-        $this->checkFailedJobsAnomaly($commandName);
-        $this->checkJobCountAnomaly($commandName);
-    }
+        try {
+            Log::info('Starting performance analysis', [
+                'timestamp' => now()->toISOString(),
+                'config' => $this->config
+            ]);
 
-    /**
-     * Check if command execution time is abnormally long
-     */
-    private function checkPerformanceAnomaly($commandName)
-    {
-        $current = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', now()->toDateString())
-            ->first();
+            $analysis = [
+                'timestamp' => now()->toISOString(),
+                'anomalies_detected' => 0,
+                'commands_analyzed' => 0,
+                'errors' => [],
+                'warnings' => []
+            ];
 
-        if (!$current) return;
+            // Get all unique commands from recent metrics
+            $commands = $this->getRecentCommands();
+            $analysis['commands_analyzed'] = count($commands);
 
-        $historical = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', '>=', now()->subDays(config('job-monitor.analyze_mode.retention_days')))
-            ->where('run_date', '<>', now()->toDateString())
-            ->avg('avg_job_time');
-
-        if ($historical && $current->avg_job_time > ($historical * config('job-monitor.analyze_mode.performance_threshold'))) {
-            event(new PerformanceAnomalyDetected(
-                $commandName,
-                'performance',
-                [
-                    'current_time' => $current->avg_job_time,
-                    'historical_average' => $historical,
-                    'threshold' => config('job-monitor.analyze_mode.performance_threshold'),
-                    'multiplier' => $current->avg_job_time / $historical
-                ]
-            ));
-        }
-    }
-
-    /**
-     * Check if failed jobs count is abnormally high
-     */
-    private function checkFailedJobsAnomaly($commandName)
-    {
-        $current = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', now()->toDateString())
-            ->first();
-
-        if (!$current || $current->failed_jobs == 0) return;
-
-        $historical = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', '>=', now()->subDays(config('job-monitor.analyze_mode.retention_days')))
-            ->where('run_date', '<>', now()->toDateString())
-            ->avg('failed_jobs');
-
-        if ($historical && $current->failed_jobs > ($historical * config('job-monitor.analyze_mode.failed_jobs_threshold'))) {
-            event(new PerformanceAnomalyDetected(
-                $commandName,
-                'failed_jobs',
-                [
-                    'current_failed' => $current->failed_jobs,
-                    'historical_average' => $historical,
-                    'threshold' => config('job-monitor.analyze_mode.failed_jobs_threshold'),
-                    'multiplier' => $current->failed_jobs / $historical
-                ]
-            ));
-        }
-    }
-
-    /**
-     * Check if total job count is unusual
-     */
-    private function checkJobCountAnomaly($commandName)
-    {
-        $current = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', now()->toDateString())
-            ->first();
-
-        if (!$current) return;
-
-        $historical = CommandMetric::where('command_name', $commandName)
-            ->where('run_date', '>=', now()->subDays(config('job-monitor.analyze_mode.retention_days')))
-            ->where('run_date', '<>', now()->toDateString())
-            ->avg('job_count');
-
-        if ($historical && $current->job_count > ($historical * config('job-monitor.analyze_mode.job_count_threshold'))) {
-            event(new PerformanceAnomalyDetected(
-                $commandName,
-                'high_job_count',
-                [
-                    'current_count' => $current->job_count,
-                    'historical_average' => $historical,
-                    'threshold' => config('job-monitor.analyze_mode.job_count_threshold'),
-                    'multiplier' => $current->job_count / $historical
-                ]
-            ));
-        }
-
-        // Check for unusually low job count
-        if ($historical && $current->job_count < ($historical * 0.5)) {
-            event(new PerformanceAnomalyDetected(
-                $commandName,
-                'low_job_count',
-                [
-                    'current_count' => $current->job_count,
-                    'historical_average' => $historical,
-                    'threshold' => 0.5,
-                    'multiplier' => $current->job_count / $historical
-                ]
-            ));
-        }
-    }
-
-    /**
-     * Check for scheduled commands that should have run but didn't
-     * Uses Laravel's Schedule service for robust schedule discovery
-     */
-    private function checkMissedScheduledCommands()
-    {
-        $scheduledCommands = $this->getScheduledCommands();
-        $thresholdHours = config('job-monitor.analyze_mode.missed_execution_threshold_hours');
-        foreach ($scheduledCommands as $event) {
-            $command = $event['command'];
-            $nextRun = Carbon::parse($event['nextRun']);
-            $expression = $event['expression'];
-            $description = $event['description'];
-
-            // Only consider console runs (manual or schedule)
-            $lastExecution = CommandMetric::where('command_name', $command)
-                ->where('source', 'console')
-                ->orderBy('run_date', 'desc')
-                ->first();
-
-            if (!$lastExecution) {
-                // Command has never run
-                event(new PerformanceAnomalyDetected(
-                    $command,
-                    'never_executed',
-                    [
-                        'schedule_expression' => $expression,
-                        'description' => $description,
-                        'expected_next_run' => $nextRun->toDateTimeString(),
-                    ]
-                ));
-                continue;
+            if (empty($commands)) {
+                Log::info('No commands found for analysis');
+                $analysis['warnings'][] = 'No commands found for analysis';
+                return $analysis;
             }
 
-            // If the next scheduled run is in the past by more than threshold, it's missed
-            $now = now();
-            if ($now->greaterThan($nextRun) && $now->diffInHours($nextRun) > $thresholdHours) {
-                event(new PerformanceAnomalyDetected(
-                    $command,
-                    'missed_execution',
-                    [
-                        'last_execution' => $lastExecution->run_date,
-                        'expected_next_run' => $nextRun->toDateTimeString(),
-                        'hours_overdue' => $now->diffInHours($nextRun),
-                        'schedule_expression' => $expression,
-                        'description' => $description,
-                    ]
-                ));
+            foreach ($commands as $command) {
+                try {
+                    $commandAnalysis = $this->analyzeCommand($command);
+                    if ($commandAnalysis['has_anomalies']) {
+                        $analysis['anomalies_detected']++;
+                        // Add summary for this command
+                        $commandAnalysis['summary'] = $this->getAnalysisSummary($commandAnalysis);
+                    }
+                } catch (Exception $e) {
+                    $error = "Error analyzing command '{$command}': " . $e->getMessage();
+                    Log::error($error, ['command' => $command, 'exception' => $e]);
+                    $analysis['errors'][] = $error;
+                }
             }
+
+            // Add overall analysis summary
+            $analysis['summary'] = [
+                'total_anomalies' => $analysis['anomalies_detected'],
+                'commands_analyzed' => $analysis['commands_analyzed'],
+                'anomaly_rate' => $analysis['commands_analyzed'] > 0 ? 
+                    round(($analysis['anomalies_detected'] / $analysis['commands_analyzed']) * 100, 2) : 0
+            ];
+
+            // Check for missed scheduled executions
+            if ($this->config['schedule_analysis_enabled']) {
+                try {
+                    $missedExecutions = $this->checkMissedScheduledExecutions();
+                    if (!empty($missedExecutions)) {
+                        $analysis['warnings'][] = "Missed scheduled executions detected: " . implode(', ', $missedExecutions);
+                    }
+                } catch (Exception $e) {
+                    $error = "Error checking missed scheduled executions: " . $e->getMessage();
+                    Log::error($error, ['exception' => $e]);
+                    $analysis['errors'][] = $error;
+                }
+            }
+
+            Log::info('Performance analysis completed', [
+                'anomalies_detected' => $analysis['anomalies_detected'],
+                'commands_analyzed' => $analysis['commands_analyzed']
+            ]);
+
+            return $analysis;
+
+        } catch (Exception $e) {
+            Log::error('Performance analysis failed', [
+                'exception' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw $e;
         }
     }
 
     /**
-     * Check for API-triggered commands that should have run but didn't
-     * (e.g., commands called via Artisan::call from HTTP requests)
-     * You can customize the threshold as needed.
+     * Analyze all commands for anomalies
+     *
+     * @return array
+     * @throws Exception
      */
-    private function checkMissedApiCommands()
+    public function analyzeAllCommands(): array
     {
-        // Define which commands are expected to be called via API and their expected interval (in minutes)
-        $apiCommands = config('job-monitor.api_commands', []); // e.g. ['my:api-command' => 60]
-        foreach ($apiCommands as $command => $expectedIntervalMinutes) {
-            $lastExecution = CommandMetric::where('command_name', $command)
-                ->where('source', 'api')
-                ->orderBy('run_date', 'desc')
-                ->first();
-            $now = now();
-            if (!$lastExecution || $now->diffInMinutes($lastExecution->run_date) > $expectedIntervalMinutes) {
-                event(new PerformanceAnomalyDetected(
-                    $command,
-                    'missed_api_call',
-                    [
-                        'last_execution' => $lastExecution ? $lastExecution->run_date : null,
-                        'expected_interval_minutes' => $expectedIntervalMinutes,
-                        'now' => $now->toDateTimeString(),
-                    ]
-                ));
-            }
-        }
+        return $this->analyze();
     }
 
     /**
-     * Get scheduled commands using Laravel's Schedule service
-     * Returns array of [command, expression, description, nextRun]
+     * Analyze a specific command for anomalies
+     *
+     * @param string $commandName
+     * @return array
      */
-    private function getScheduledCommands()
+    public function analyzeCommand(string $commandName): array
     {
-        $schedule = app()->make(Schedule::class);
-        $commands = [];
+        $retentionDays = $this->config['retention_days'];
+        $startDate = now()->subDays($retentionDays);
 
-        foreach ($schedule->events() as $event) {
-            $artisanCommand = Str::before(Str::after($event->command, 'artisan '), ' ');
-            if (in_array($artisanCommand, config('job-monitor.ignore_commands'))) {
-                continue;
-            }
-            $commands[] = [
-                'command' => $event->command,
-                'expression' => $event->expression,
-                'description' => $event->description,
-                'nextRun' => $event->nextRunDate()->toDateTimeString(),
+        // Get recent metrics for this command
+        $recentMetrics = CommandMetric::byCommand($commandName)
+            ->byDateRange($startDate, now())
+            ->orderBy('run_date', 'desc')
+            ->get();
+        
+        // Get latest metric
+        $latestMetric = $recentMetrics->first();
+        
+        // Check if we have enough data for analysis
+        if ($recentMetrics->count() < 2) {
+            return [
+                'has_anomalies' => false,
+                'reason' => 'Insufficient data for analysis (need at least 2 data points)',
+                'data_points' => $recentMetrics->count()
             ];
         }
-        return $commands;
+        
+        // Calculate baseline metrics (excluding the latest metric)
+        $historicalMetrics = $recentMetrics->except(['id' => $latestMetric->id]);
+        $baseline = $this->calculateBaseline($historicalMetrics);
+        
+        // Check for anomalies
+        $anomalies = $this->detectAnomalies($latestMetric, $baseline);
+        
+        $commandAnalysis = [
+            'has_anomalies' => !empty($anomalies),
+            'anomalies' => $anomalies,
+            'baseline' => $baseline,
+            'latest_metric' => $latestMetric,
+            'data_points' => $recentMetrics->count()
+        ];
+        
+        if ($commandAnalysis['has_anomalies']) {
+            $this->handleAnomaly($commandName, $commandAnalysis);
+            // Add summary for this command
+            $commandAnalysis['summary'] = $this->getAnalysisSummary($commandAnalysis);
+        }
+        
+        return $commandAnalysis;
+    }
+
+    /**
+     * Calculate baseline metrics from historical data
+     *
+     * @param \Illuminate\Database\Eloquent\Collection $metrics
+     * @return array
+     */
+    private function calculateBaseline($metrics): array
+    {
+        $totalTime = $metrics->avg('total_time');
+        $jobCount = $metrics->avg('job_count');
+        $successJobs = $metrics->avg('success_jobs');
+        $failedJobs = $metrics->avg('failed_jobs');
+        $avgJobTime = $metrics->avg('avg_job_time');
+        $peakMemory = $metrics->avg('peak_memory');
+
+        // Calculate standard deviations for anomaly detection
+        $totalTimeStdDev = $this->calculateStandardDeviation($metrics->pluck('total_time')->toArray());
+        $jobCountStdDev = $this->calculateStandardDeviation($metrics->pluck('job_count')->toArray());
+        $failedJobsStdDev = $this->calculateStandardDeviation($metrics->pluck('failed_jobs')->toArray());
+
+        return [
+            'total_time' => [
+                'average' => $totalTime,
+                'std_dev' => $totalTimeStdDev,
+                'threshold_upper' => $totalTime * $this->config['performance_threshold'],
+                'threshold_lower' => $totalTime * $this->config['performance_threshold_lower']
+            ],
+            'job_count' => [
+                'average' => $jobCount,
+                'std_dev' => $jobCountStdDev,
+                'threshold_upper' => $jobCount * $this->config['job_count_threshold'],
+                'threshold_lower' => $jobCount * $this->config['job_count_threshold_lower']
+            ],
+            'failed_jobs' => [
+                'average' => $failedJobs,
+                'std_dev' => $failedJobsStdDev,
+                'threshold_upper' => $failedJobs * $this->config['failed_jobs_threshold'],
+                'threshold_lower' => $failedJobs * $this->config['failed_jobs_threshold_lower']
+            ],
+            'success_jobs' => $successJobs,
+            'avg_job_time' => $avgJobTime,
+            'peak_memory' => $peakMemory
+        ];
+    }
+
+    /**
+     * Detect anomalies based on thresholds
+     *
+     * @param CommandMetric $metric
+     * @param array $baseline
+     * @return array
+     */
+    private function detectAnomalies(CommandMetric $metric, array $baseline): array
+    {
+        $anomalies = [];
+
+        // Check total execution time - both upper and lower bounds
+        if ($metric->total_time > $baseline['total_time']['threshold_upper']) {
+            $anomalies[] = [
+                'type' => 'performance_degradation',
+                'metric' => 'total_time',
+                'current' => $metric->total_time,
+                'threshold' => $baseline['total_time']['threshold_upper'],
+                'baseline_avg' => $baseline['total_time']['average'],
+                'direction' => 'worse',
+                'percentage_change' => $this->calculatePercentageChange($metric->total_time, $baseline['total_time']['average']),
+                'severity' => $this->calculateSeverity($metric->total_time, $baseline['total_time']['average'])
+            ];
+        }
+        
+        if ($metric->total_time < $baseline['total_time']['threshold_lower']) {
+            $anomalies[] = [
+                'type' => 'performance_improvement',
+                'metric' => 'total_time',
+                'current' => $metric->total_time,
+                'threshold' => $baseline['total_time']['threshold_lower'],
+                'baseline_avg' => $baseline['total_time']['average'],
+                'direction' => 'better',
+                'percentage_change' => $this->calculatePercentageChange($metric->total_time, $baseline['total_time']['average']),
+                'severity' => $this->calculateSeverity($metric->total_time, $baseline['total_time']['average'])
+            ];
+        }
+
+        // Check job count - both upper and lower bounds
+        if ($metric->job_count > $baseline['job_count']['threshold_upper']) {
+            $anomalies[] = [
+                'type' => 'unusual_workload_high',
+                'metric' => 'job_count',
+                'current' => $metric->job_count,
+                'threshold' => $baseline['job_count']['threshold_upper'],
+                'baseline_avg' => $baseline['job_count']['average'],
+                'direction' => 'higher',
+                'percentage_change' => $this->calculatePercentageChange($metric->job_count, $baseline['job_count']['average']),
+                'severity' => $this->calculateSeverity($metric->job_count, $baseline['job_count']['average'])
+            ];
+        }
+        
+        if ($metric->job_count < $baseline['job_count']['threshold_lower']) {
+            $anomalies[] = [
+                'type' => 'unusual_workload_low',
+                'metric' => 'job_count',
+                'current' => $metric->job_count,
+                'threshold' => $baseline['job_count']['threshold_lower'],
+                'baseline_avg' => $baseline['job_count']['average'],
+                'direction' => 'lower',
+                'percentage_change' => $this->calculatePercentageChange($metric->job_count, $baseline['job_count']['average']),
+                'severity' => $this->calculateSeverity($metric->job_count, $baseline['job_count']['average'])
+            ];
+        }
+
+        // Check failed jobs - both upper and lower bounds
+        if ($metric->failed_jobs > $baseline['failed_jobs']['threshold_upper']) {
+            $anomalies[] = [
+                'type' => 'high_failure_rate',
+                'metric' => 'failed_jobs',
+                'current' => $metric->failed_jobs,
+                'threshold' => $baseline['failed_jobs']['threshold_upper'],
+                'baseline_avg' => $baseline['failed_jobs']['average'],
+                'direction' => 'worse',
+                'percentage_change' => $this->calculatePercentageChange($metric->failed_jobs, $baseline['failed_jobs']['average']),
+                'severity' => $this->calculateSeverity($metric->failed_jobs, $baseline['failed_jobs']['average'])
+            ];
+        }
+        
+        if ($metric->failed_jobs < $baseline['failed_jobs']['threshold_lower']) {
+            $anomalies[] = [
+                'type' => 'low_failure_rate',
+                'metric' => 'failed_jobs',
+                'current' => $metric->failed_jobs,
+                'threshold' => $baseline['failed_jobs']['threshold_lower'],
+                'baseline_avg' => $baseline['failed_jobs']['average'],
+                'direction' => 'better',
+                'percentage_change' => $this->calculatePercentageChange($metric->failed_jobs, $baseline['failed_jobs']['average']),
+                'severity' => $this->calculateSeverity($metric->failed_jobs, $baseline['failed_jobs']['average'])
+            ];
+        }
+
+        // Check for zero success jobs when there are jobs
+        if ($metric->job_count > 0 && $metric->success_jobs === 0) {
+            $anomalies[] = [
+                'type' => 'complete_failure',
+                'metric' => 'success_jobs',
+                'current' => $metric->success_jobs,
+                'baseline_avg' => $baseline['success_jobs'],
+                'direction' => 'worse',
+                'percentage_change' => $this->calculatePercentageChange($metric->success_jobs, $baseline['success_jobs']),
+                'severity' => 'critical'
+            ];
+        }
+
+        return $anomalies;
+    }
+
+    /**
+     * Calculate percentage change from baseline
+     *
+     * @param float $current
+     * @param float $baseline
+     * @return float
+     */
+    private function calculatePercentageChange(float $current, float $baseline): float
+    {
+        if ($baseline == 0) {
+            return 0.0;
+        }
+
+        return (($current - $baseline) / $baseline) * 100;
+    }
+
+    /**
+     * Calculate severity level based on deviation from baseline
+     *
+     * @param float $current
+     * @param float $baseline
+     * @return string
+     */
+    private function calculateSeverity(float $current, float $baseline): string
+    {
+        if ($baseline == 0) {
+            return 'warning';
+        }
+
+        $deviation = abs(($current - $baseline) / $baseline);
+
+        if ($deviation >= 3.0) {
+            return 'critical';
+        } elseif ($deviation >= 2.0) {
+            return 'high';
+        } elseif ($deviation >= 1.5) {
+            return 'medium';
+        } else {
+            return 'low';
+        }
+    }
+
+    /**
+     * Calculate standard deviation
+     *
+     * @param array $values
+     * @return float
+     */
+    private function calculateStandardDeviation(array $values): float
+    {
+        $count = count($values);
+        if ($count < 2) {
+            return 0.0;
+        }
+
+        $mean = array_sum($values) / $count;
+        $variance = 0.0;
+
+        foreach ($values as $value) {
+            $variance += pow($value - $mean, 2);
+        }
+
+        return sqrt($variance / ($count - 1));
+    }
+
+    /**
+     * Get a summary of the analysis results
+     *
+     * @param array $analysis
+     * @return array
+     */
+    public function getAnalysisSummary(array $analysis): array
+    {
+        $summary = [
+            'total_anomalies' => 0,
+            'performance_degradations' => 0,
+            'performance_improvements' => 0,
+            'workload_anomalies' => 0,
+            'failure_rate_anomalies' => 0,
+            'critical_anomalies' => 0,
+            'high_anomalies' => 0,
+            'medium_anomalies' => 0,
+            'low_anomalies' => 0,
+        ];
+
+        if (isset($analysis['anomalies'])) {
+            foreach ($analysis['anomalies'] as $anomaly) {
+                $summary['total_anomalies']++;
+                
+                // Count by type
+                switch ($anomaly['type']) {
+                    case 'performance_degradation':
+                        $summary['performance_degradations']++;
+                        break;
+                    case 'performance_improvement':
+                        $summary['performance_improvements']++;
+                        break;
+                    case 'unusual_workload_high':
+                    case 'unusual_workload_low':
+                        $summary['workload_anomalies']++;
+                        break;
+                    case 'high_failure_rate':
+                    case 'low_failure_rate':
+                        $summary['failure_rate_anomalies']++;
+                        break;
+                }
+                
+                // Count by severity
+                switch ($anomaly['severity']) {
+                    case 'critical':
+                        $summary['critical_anomalies']++;
+                        break;
+                    case 'high':
+                        $summary['high_anomalies']++;
+                        break;
+                    case 'medium':
+                        $summary['medium_anomalies']++;
+                        break;
+                    case 'low':
+                        $summary['low_anomalies']++;
+                        break;
+                }
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Handle detected anomalies
+     *
+     * @param string $commandName
+     * @param array $analysis
+     * @return void
+     */
+    private function handleAnomaly(string $commandName, array $analysis): void
+    {
+        foreach ($analysis['anomalies'] as $anomaly) {
+            $event = new PerformanceAnomalyDetected(
+                $commandName,
+                $anomaly['type'],
+                $anomaly['metric'],
+                $anomaly['current'],
+                $anomaly['baseline_avg'],
+                $anomaly['severity'],
+                $analysis['latest_metric']
+            );
+
+            event($event);
+
+            Log::warning('Performance anomaly detected', [
+                'command' => $commandName,
+                'anomaly' => $anomaly,
+                'metric_id' => $analysis['latest_metric']->id
+            ]);
+        }
+    }
+
+    /**
+     * Check for missed scheduled executions
+     *
+     * @return array
+     */
+    private function checkMissedScheduledExecutions(): array
+    {
+        $missedCommands = [];
+        $thresholdHours = $this->config['missed_execution_threshold_hours'];
+        $cutoffTime = now()->subHours($thresholdHours);
+
+        // Check API-triggered commands
+        foreach (config('job-monitor.api_commands', []) as $command => $expectedIntervalMinutes) {
+            $lastExecution = CommandMetric::byCommand($command)
+                ->orderBy('created_at', 'desc')
+                ->first();
+
+            if (!$lastExecution || $lastExecution->created_at < $cutoffTime) {
+                $missedCommands[] = $command;
+            }
+        }
+
+        return $missedCommands;
+    }
+
+    /**
+     * Get recent commands for analysis
+     *
+     * @return array
+     */
+    private function getRecentCommands(): array
+    {
+        $retentionDays = $this->config['retention_days'];
+        $startDate = now()->subDays($retentionDays);
+
+        return CommandMetric::byDateRange($startDate, now())
+            ->distinct()
+            ->pluck('command_name')
+            ->filter(function ($command) {
+                return !in_array($command, config('job-monitor.ignore_commands', []));
+            })
+            ->values()
+            ->toArray();
     }
 }

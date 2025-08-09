@@ -32,7 +32,7 @@ trait TrackableJob
      */
     public function setCommandProcessId(?string $id): self
     {
-        if ($id && !Str::isUuid($id)) {
+        if ($id && !$this->isValidUuid($id)) {
             throw new \InvalidArgumentException('Process ID must be a valid UUID');
         }
 
@@ -105,7 +105,18 @@ trait TrackableJob
      */
     public function setJobType(string $type): self
     {
+        if (strlen($type) > 100) {
+            throw new \InvalidArgumentException('Job type must be 100 characters or less');
+        }
         $this->jobType = $type;
         return $this;
+    }
+
+    /**
+     * Validates if a string is a valid UUID
+     */
+    private function isValidUuid(string $uuid): bool
+    {
+        return preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $uuid) === 1;
     }
 }

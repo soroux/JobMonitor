@@ -9,7 +9,7 @@ return new class extends Migration {
     {
         Schema::create('command_metrics', function (Blueprint $table) {
             $table->id();
-            $table->string('process_id');
+            $table->string('process_id')->unique();
             $table->string('command_name');
             $table->string('source')->nullable(); // console, api
             $table->float('total_time');
@@ -20,6 +20,16 @@ return new class extends Migration {
             $table->integer('peak_memory');
             $table->date('run_date');
             $table->timestamps();
+            
+            // Add indexes for performance optimization
+            $table->index(['command_name', 'run_date']);
+            $table->index(['process_id']);
+            $table->index(['run_date']);
+            $table->index(['source']);
+            $table->index(['created_at']);
+            $table->index(['command_name', 'created_at']);
+            $table->index(['total_time']);
+            $table->index(['job_count']);
         });
     }
 

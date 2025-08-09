@@ -30,18 +30,18 @@ class PerformanceAnalyzerCommand extends Command
                 $this->analyzer->analyzeCommand($commandName);
             } else {
                 $this->info('Analyzing all commands...');
-                $this->analyzer->analyzeAllCommands();
+                $this->analyzer->analyze();
             }
 
             $this->info('Performance analysis completed successfully.');
-            
+
         } catch (\Exception $e) {
             $this->error('Error during performance analysis: ' . $e->getMessage());
             Log::error('Performance analysis failed', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            
+
             return 1;
         }
 

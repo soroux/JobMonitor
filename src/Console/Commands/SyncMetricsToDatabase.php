@@ -3,252 +3,320 @@
 namespace Soroux\JobMonitor\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
 use Soroux\JobMonitor\Models\CommandMetric;
 use Soroux\JobMonitor\Models\JobMetric;
-use Carbon\Carbon;
 use Exception;
+use Carbon\Carbon;
 
 class SyncMetricsToDatabase extends Command
 {
-    protected $signature = 'metrics:sync {--force : Force sync even if disabled} {--dry-run : Show what would be synced without actually syncing}';
-    protected $description = 'Sync Redis metrics to database with robust error handling';
-    
-    protected $redis;
+    protected $signature = 'metrics:sync
+                            {--force : Force sync even if disabled in config}
+                            {--dry-run : Show what would be synced without actually syncing}
+                            {--batch-size= : Override batch size from config}
+                            {--cleanup : Clean up old Redis data after sync}';
+
+    protected $description = 'Sync metrics from Redis to database';
+
+    private $redis;
+    private $config;
+    private $startTime;
+    private $memoryStart;
     protected $prefix;
-    protected $startTime;
-    protected $memoryLimit;
-    protected $timeoutLimit;
-    protected $stats = [
-        'commands_synced' => 0,
-        'jobs_synced' => 0,
-        'errors' => 0,
-        'warnings' => 0,
-    ];
 
-    public function handle()
+
+    public function __construct()
     {
-        // Check if sync is enabled
-        if (!config('job-monitor.sync.enabled') && !$this->option('force')) {
-            $this->warn('Sync is disabled. Use --force to override.');
-            return 0;
-        }
+        parent::__construct();
+        $this->config = config('job-monitor.sync');
+        $this->redis = Redis::connection(config('job-monitor.redis.connection', 'default'));
+        $client = $this->redis->client();
+        $this->prefix = $client->getOption(\Redis::OPT_PREFIX);
+    }
 
+    public function handle(): int
+    {
         $this->startTime = microtime(true);
-        $this->memoryLimit = config('job-monitor.sync.max_memory_mb', 100) * 1024 * 1024; // Convert to bytes
-        $this->timeoutLimit = config('job-monitor.sync.timeout_seconds', 300);
+        $this->memoryStart = memory_get_usage(true);
 
-        $this->info('Starting metrics sync...');
-        
         try {
-            $this->initializeRedis();
-            $this->validateRedisConnection();
-            
-            if ($this->option('dry-run')) {
-                $this->info('DRY RUN MODE - No data will be synced');
+            // Check if sync is enabled
+            if (!$this->config['enabled'] && !$this->option('force')) {
+                $this->warn('Sync is disabled in configuration. Use --force to override.');
+                return 0;
             }
 
-            $this->syncCommandMetrics();
-            $this->syncJobMetrics();
-            
-            if (config('job-monitor.sync.cleanup_enabled')) {
-                $this->cleanupOlderMetrics();
+            $this->info('Starting metrics sync...');
+            $this->info('Configuration: ' . json_encode($this->config, JSON_PRETTY_PRINT));
+
+            // Validate Redis connection
+            if (!$this->validateRedisConnection()) {
+                return 1;
             }
 
-            $this->displayStats();
+            // Sync command metrics
+            $commandMetricsSynced = $this->syncCommandMetrics();
+
+            // Sync job metrics
+            $jobMetricsSynced = $this->syncJobMetrics();
+
+            // Cleanup if requested
+            if ($this->option('cleanup') || $this->config['cleanup_enabled']) {
+                $this->cleanupOldRedisData();
+            }
+
+            // Log summary
+            $this->logSyncSummary($commandMetricsSynced, $jobMetricsSynced);
+
             $this->info('Sync completed successfully!');
-            
+            $this->info("Synced {$commandMetricsSynced} command metrics and {$jobMetricsSynced} job metrics");
+
             return 0;
-            
+
         } catch (Exception $e) {
             $this->error('Sync failed: ' . $e->getMessage());
             Log::error('Metrics sync failed', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'stats' => $this->stats
+                'exception' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
             ]);
-            
             return 1;
         }
     }
 
-    protected function initializeRedis()
-    {
-        try {
-            $this->redis = Redis::connection(config('job-monitor.monitor-connection'));
-            $client = $this->redis->client();
-            $this->prefix = $client->getOption(\Redis::OPT_PREFIX);
-            
-            $this->info('Redis connection established');
-        } catch (Exception $e) {
-            throw new Exception('Failed to connect to Redis: ' . $e->getMessage());
-        }
-    }
-
-    protected function validateRedisConnection()
+    /**
+     * Validate Redis connection
+     *
+     * @return bool
+     */
+    private function validateRedisConnection(): bool
     {
         try {
             $this->redis->ping();
-            $this->info('Redis connection validated');
+            $this->info('✓ Redis connection validated');
+            return true;
         } catch (Exception $e) {
-            throw new Exception('Redis connection validation failed: ' . $e->getMessage());
+            $this->error('✗ Redis connection failed: ' . $e->getMessage());
+            return false;
         }
     }
 
-    protected function syncCommandMetrics()
+    /**
+     * Sync command metrics from Redis to database
+     *
+     * @return int
+     */
+    private function syncCommandMetrics(): int
     {
         $this->info('Syncing command metrics...');
-        
+
+        $batchSize = $this->option('batch-size') ?: $this->config['batch_size'];
+        $synced = 0;
+        $errors = 0;
+
         try {
-            $commandKeys = $this->redis->keys("command:metrics:*");
-            $totalKeys = count($commandKeys);
-            
-            if ($totalKeys === 0) {
+            // Get all command metric keys
+            $keys = $this->redis->keys('command:metrics:*');
+
+            if (empty($keys)) {
                 $this->info('No command metrics found in Redis');
-                return;
+                return 0;
             }
 
-            $this->info("Found {$totalKeys} command metrics to sync");
-            $bar = $this->output->createProgressBar($totalKeys);
-            $bar->start();
+            $this->info("Found " . count($keys) . " command metric keys");
 
-            $syncedCount = 0;
-            $errorCount = 0;
+            // Process in batches
+            $chunks = array_chunk($keys, $batchSize);
 
-            foreach ($commandKeys as $key) {
-                $this->checkMemoryAndTimeout();
-                
-                try {
-                    $jobKey = $this->extractKeyWithoutPrefix($key);
-                    if (!$jobKey) continue;
+            foreach ($chunks as $chunkIndex => $chunk) {
+                $this->info("Processing chunk " . ($chunkIndex + 1) . " of " . count($chunks));
 
-                    $metrics = $this->redis->hgetall($jobKey);
-                    
-                    if (empty($metrics)) {
-                        $this->warn("Empty metrics for key: {$key}");
-                        $this->stats['warnings']++;
-                        continue;
+                foreach ($chunk as $key) {
+                    try {
+                        $jobKey = $this->extractKeyWithoutPrefix($key);
+                        if (!$jobKey) continue;
+
+                        $metricData = $this->redis->hgetall($jobKey);
+
+                        if (empty($metricData)) {
+                            continue;
+                        }
+
+                        if ($this->option('dry-run')) {
+                            $this->line("Would sync: {$key} - " . json_encode($metricData));
+                            $synced++;
+                            continue;
+                        }
+
+                        // Validate and create/update metric
+                        if ($this->syncCommandMetric($key, $metricData)) {
+                            $synced++;
+                        }
+
+                        // Add delay between chunks to prevent overwhelming the system
+                        if ($chunkIndex > 0 && $this->config['chunk_delay_ms'] > 0) {
+                            usleep($this->config['chunk_delay_ms'] * 1000);
+                        }
+
+                    } catch (Exception $e) {
+                        $errors++;
+                        $this->warn("Error processing key {$key}: " . $e->getMessage());
+                        Log::warning("Failed to sync command metric", [
+                            'key' => $key,
+                            'error' => $e->getMessage()
+                        ]);
                     }
-
-                    if (!$this->validateCommandMetrics($metrics)) {
-                        $this->warn("Invalid metrics for key: {$key}");
-                        $this->stats['warnings']++;
-                        continue;
-                    }
-
-                    if (!$this->option('dry-run')) {
-                        $this->createOrUpdateCommandMetric($metrics);
-                    }
-                    
-                    $syncedCount++;
-                    $this->stats['commands_synced']++;
-                    
-                } catch (Exception $e) {
-                    $this->error("Error syncing command metric {$key}: " . $e->getMessage());
-                    $errorCount++;
-                    $this->stats['errors']++;
-                    Log::warning('Command metric sync error', [
-                        'key' => $key,
-                        'error' => $e->getMessage()
-                    ]);
                 }
 
-                $bar->advance();
+                // Check memory usage
+                $this->checkMemoryUsage();
             }
 
-            $bar->finish();
-            $this->newLine();
-            $this->info("Command metrics synced: {$syncedCount}, Errors: {$errorCount}");
+        } catch (Exception $e) {
+            $this->error('Failed to sync command metrics: ' . $e->getMessage());
+            throw $e;
+        }
+
+        if ($errors > 0) {
+            $this->warn("Completed with {$errors} errors");
+        }
+
+        return $synced;
+    }
+
+    /**
+     * Sync a single command metric
+     *
+     * @param string $key
+     * @param array $metricData
+     * @return bool
+     */
+    private function syncCommandMetric(string $key, array $metricData): bool
+    {
+        try {
+            // Extract process ID from key
+            $processId = str_replace(['command:', ':metrics'], '', $key);
+
+            // Prepare data for model
+            $data = [
+                'process_id' => $processId,
+                'command_name' => $metricData['command_name'] ?? 'unknown',
+                'source' => $metricData['source'] ?? 'console',
+                'total_time' => (float) ($metricData['total_time'] ?? 0),
+                'job_count' => (int) ($metricData['job_count'] ?? 0),
+                'success_jobs' => (int) ($metricData['success_jobs'] ?? 0),
+                'failed_jobs' => (int) ($metricData['failed_jobs'] ?? 0),
+                'avg_job_time' => (float) ($metricData['avg_job_time'] ?? 0),
+                'peak_memory' => (int) ($metricData['peak_memory'] ?? 0),
+                'run_date' => $metricData['run_date'] ?? now()->toDateString(),
+            ];
+
+            // Validate data
+            CommandMetric::validate($data);
+
+            // Create or update metric
+            CommandMetric::updateOrCreate(
+                ['process_id' => $processId],
+                $data
+            );
+
+            return true;
 
         } catch (Exception $e) {
-            throw new Exception('Command metrics sync failed: ' . $e->getMessage());
+            Log::error('Failed to sync command metric', [
+                'key' => $key,
+                'data' => $metricData,
+                'error' => $e->getMessage()
+            ]);
+            return false;
         }
     }
 
-    protected function syncJobMetrics()
+    /**
+     * Sync job metrics from Redis to database
+     *
+     * @return int
+     */
+    private function syncJobMetrics(): int
     {
         $this->info('Syncing job metrics...');
-        
+
+        $batchSize = $this->option('batch-size') ?: $this->config['batch_size'];
+        $synced = 0;
+        $errors = 0;
+
         try {
-            $jobKeys = $this->redis->keys("job:metrics:*");
-            $totalKeys = count($jobKeys);
-            
-            if ($totalKeys === 0) {
+            // Get all job metric keys
+            $keys = $this->redis->keys('job:metrics:*');
+
+            if (empty($keys)) {
                 $this->info('No job metrics found in Redis');
-                return;
+                return 0;
             }
 
-            $this->info("Found {$totalKeys} job metrics to sync");
-            $batchSize = config('job-monitor.sync.batch_size', 500);
-            $batch = [];
-            $syncedCount = 0;
-            $errorCount = 0;
+            $this->info("Found " . count($keys) . " job metric keys");
 
-            $bar = $this->output->createProgressBar($totalKeys);
-            $bar->start();
+            // Process in batches
+            $chunks = array_chunk($keys, $batchSize);
 
-            foreach ($jobKeys as $key) {
-                $this->checkMemoryAndTimeout();
-                
-                try {
-                    $jobKey = $this->extractKeyWithoutPrefix($key);
-                    if (!$jobKey) continue;
+            foreach ($chunks as $chunkIndex => $chunk) {
+                $this->info("Processing chunk " . ($chunkIndex + 1) . " of " . count($chunks));
 
-                    $metrics = $this->redis->hgetall($jobKey);
-                    
-                    if (empty($metrics)) {
-                        $this->warn("Empty metrics for key: {$key}");
-                        $this->stats['warnings']++;
-                        continue;
-                    }
+                foreach ($chunk as $key) {
+                    try {
+                        $jobKey = $this->extractKeyWithoutPrefix($key);
+                        if (!$jobKey) continue;
 
-                    if (!$this->validateJobMetrics($metrics)) {
-                        $this->warn("Invalid metrics for key: {$key}");
-                        $this->stats['warnings']++;
-                        continue;
-                    }
+                        $jobData = $this->redis->hgetall($key);
 
-                    $batch[] = $this->prepareJobMetricData($key, $metrics);
-                    
-                    if (count($batch) >= $batchSize) {
-                        if (!$this->option('dry-run')) {
-                            $this->insertJobMetricsBatch($batch);
+                        if (empty($jobData)) {
+                            continue;
                         }
-                        $syncedCount += count($batch);
-                        $this->stats['jobs_synced'] += count($batch);
-                        $batch = [];
-                    }
 
-                } catch (Exception $e) {
-                    $this->error("Error syncing job metric {$key}: " . $e->getMessage());
-                    $errorCount++;
-                    $this->stats['errors']++;
-                    Log::warning('Job metric sync error', [
-                        'key' => $key,
-                        'error' => $e->getMessage()
-                    ]);
+                        if ($this->option('dry-run')) {
+                            $this->line("Would sync: {$key} - " . json_encode($jobData));
+                            $synced++;
+                            continue;
+                        }
+
+                        // Sync each job in the command
+                        foreach ($jobData as $jobId => $jobInfo) {
+                            if ($this->syncJobMetric($key, $jobId, $jobInfo)) {
+                                $synced++;
+                            }
+                        }
+
+                        // Add delay between chunks
+                        if ($chunkIndex > 0 && $this->config['chunk_delay_ms'] > 0) {
+                            usleep($this->config['chunk_delay_ms'] * 1000);
+                        }
+
+                    } catch (Exception $e) {
+                        $errors++;
+                        $this->warn("Error processing key {$key}: " . $e->getMessage());
+                        Log::warning("Failed to sync job metrics", [
+                            'key' => $key,
+                            'error' => $e->getMessage()
+                        ]);
+                    }
                 }
 
-                $bar->advance();
+                // Check memory usage
+                $this->checkMemoryUsage();
             }
-
-            // Insert remaining batch
-            if (!empty($batch) && !$this->option('dry-run')) {
-                $this->insertJobMetricsBatch($batch);
-                $syncedCount += count($batch);
-                $this->stats['jobs_synced'] += count($batch);
-            }
-
-            $bar->finish();
-            $this->newLine();
-            $this->info("Job metrics synced: {$syncedCount}, Errors: {$errorCount}");
 
         } catch (Exception $e) {
-            throw new Exception('Job metrics sync failed: ' . $e->getMessage());
+            $this->error('Failed to sync job metrics: ' . $e->getMessage());
+            throw $e;
         }
-    }
 
+        if ($errors > 0) {
+            $this->warn("Completed with {$errors} errors");
+        }
+
+        return $synced;
+    }
     protected function extractKeyWithoutPrefix($key)
     {
         if (strpos($key, $this->prefix) === 0) {
@@ -257,135 +325,156 @@ class SyncMetricsToDatabase extends Command
         return null;
     }
 
-    protected function validateCommandMetrics($metrics)
-    {
-        $required = ['command_name', 'process_id', 'start_time'];
-        foreach ($required as $field) {
-            if (!isset($metrics[$field]) || empty($metrics[$field])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    protected function validateJobMetrics($metrics)
-    {
-        $required = ['process_id', 'command_name', 'status'];
-        foreach ($required as $field) {
-            if (!isset($metrics[$field]) || empty($metrics[$field])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    protected function createOrUpdateCommandMetric($metrics)
-    {
-        $source = $metrics['source'] ?? (app()->runningInConsole() ? 'console' : 'api');
-        
-        CommandMetric::updateOrCreate(
-            [
-                'command_name' => $metrics['command_name'], 
-                'process_id' => $metrics['process_id']
-            ],
-            [
-                'total_time' => $metrics['total_job_time'] ?? 0,
-                'job_count' => $metrics['job_count'] ?? 0,
-                'success_jobs' => $metrics['success_jobs'] ?? 0,
-                'failed_jobs' => $metrics['failed_jobs'] ?? 0,
-                'avg_job_time' => ($metrics['total_job_time'] ?? 0) / max(1, $metrics['job_count'] ?? 1),
-                'peak_memory' => $metrics['peak_memory'] ?? 0,
-                'run_date' => $metrics['start_time'],
-                'source' => $source,
-                'updated_at' => now()
-            ]
-        );
-    }
-
-    protected function prepareJobMetricData($key, $metrics)
-    {
-        return [
-            'job_id' => str_replace('job:metrics:', '', $key),
-            'process_id' => $metrics['process_id'],
-            'command_name' => $metrics['command_name'],
-            'execution_time' => $metrics['execution_time'] ?? 0,
-            'memory_usage' => $metrics['memory_usage'] ?? 0,
-            'queue_time' => $metrics['queue_time'] ?? 0,
-            'status' => $metrics['status'],
-            'created_at' => $metrics['timestamp'] ?? now(),
-            'updated_at' => now()
-        ];
-    }
-
-    protected function insertJobMetricsBatch($batch)
+    /**
+     * Sync a single job metric
+     *
+     * @param string $key
+     * @param string $jobId
+     * @param string $jobInfo
+     * @return bool
+     */
+    private function syncJobMetric(string $key, string $jobId, string $jobInfo): bool
     {
         try {
-            JobMetric::insert($batch);
-        } catch (Exception $e) {
-            Log::error('Failed to insert job metrics batch', [
-                'batch_size' => count($batch),
-                'error' => $e->getMessage()
-            ]);
-            throw $e;
-        }
-    }
+            // Extract process ID from key
+            $processId = str_replace(['command:', ':jobs'], '', $key);
 
-    protected function cleanupOlderMetrics()
-    {
-        $this->info('Cleaning up old Redis metrics...');
-        
-        try {
-            $cutoff = now()->subHours(config('job-monitor.sync.cleanup_after_hours', 24));
-            $deletedCount = 0;
+            // Decode job info
+            $jobData = json_decode($jobInfo, true);
 
-            $keys = array_merge(
-                $this->redis->keys("job:metrics:*"),
-                $this->redis->keys("command:metrics:*")
+            if (!$jobData) {
+                return false;
+            }
+
+            // Prepare data for model
+            $data = [
+                'job_id' => $jobId,
+                'process_id' => $processId,
+                'command_name' => $jobData['command_name'] ?? 'unknown',
+                'execution_time' => (float) ($jobData['execution_time'] ?? 0),
+                'memory_usage' => (int) ($jobData['memory_usage'] ?? 0),
+                'queue_time' => (float) ($jobData['queue_time'] ?? 0),
+                'status' => $jobData['status'] ?? 'unknown',
+            ];
+
+            // Validate data
+            JobMetric::validate($data);
+
+            // Create or update metric
+            JobMetric::updateOrCreate(
+                ['job_id' => $jobId],
+                $data
             );
 
-            foreach ($keys as $key) {
-                $timestamp = $this->redis->hget($key, 'timestamp');
-                if ($timestamp && Carbon::parse($timestamp)->lt($cutoff)) {
-                    $this->redis->del($key);
-                    $deletedCount++;
+            return true;
+
+        } catch (Exception $e) {
+            Log::error('Failed to sync job metric', [
+                'key' => $key,
+                'job_id' => $jobId,
+                'job_info' => $jobInfo,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Clean up old Redis data
+     *
+     * @return void
+     */
+    private function cleanupOldRedisData(): void
+    {
+        $this->info('Cleaning up old Redis data...');
+
+        try {
+            $cleanupAfterHours = $this->config['cleanup_after_hours'];
+            $cutoffTime = now()->subHours($cleanupAfterHours);
+
+            // Clean up old command metrics
+            $commandKeys = $this->redis->keys('command:metrics:*');
+            $cleanedCommands = 0;
+
+            foreach ($commandKeys as $key) {
+                $metricData = $this->redis->hgetall($key);
+                if (isset($metricData['created_at'])) {
+                    $createdAt = Carbon::parse($metricData['created_at']);
+                    if ($createdAt->lt($cutoffTime)) {
+                        $this->redis->del($key);
+                        $cleanedCommands++;
+                    }
                 }
             }
 
-            $this->info("Cleaned up {$deletedCount} old metric keys");
+            // Clean up old job data
+            $jobKeys = $this->redis->keys('job:metrics:*');
+            $cleanedJobs = 0;
+
+            foreach ($jobKeys as $key) {
+                $jobData = $this->redis->hgetall($key);
+                if (isset($jobData['created_at'])) {
+                    $createdAt = Carbon::parse($jobData['created_at']);
+                    if ($createdAt->lt($cutoffTime)) {
+                        $this->redis->del($key);
+                        $cleanedJobs++;
+                    }
+                }
+            }
+
+            $this->info("Cleaned up {$cleanedCommands} command keys and {$cleanedJobs} job keys");
 
         } catch (Exception $e) {
             $this->warn('Cleanup failed: ' . $e->getMessage());
-            Log::warning('Metrics cleanup failed', ['error' => $e->getMessage()]);
+            Log::warning('Redis cleanup failed', ['error' => $e->getMessage()]);
         }
     }
 
-    protected function checkMemoryAndTimeout()
+    /**
+     * Check memory usage and warn if too high
+     *
+     * @return void
+     */
+    private function checkMemoryUsage(): void
     {
-        // Check memory usage
-        $memoryUsage = memory_get_usage(true);
-        if ($memoryUsage > $this->memoryLimit) {
-            throw new Exception("Memory limit exceeded: " . round($memoryUsage / 1024 / 1024, 2) . "MB");
-        }
+        $currentMemory = memory_get_usage(true);
+        $maxMemory = $this->config['max_memory_mb'] * 1024 * 1024; // Convert MB to bytes
 
-        // Check execution time
-        $executionTime = microtime(true) - $this->startTime;
-        if ($executionTime > $this->timeoutLimit) {
-            throw new Exception("Timeout exceeded: " . round($executionTime, 2) . " seconds");
+        if ($currentMemory > $maxMemory) {
+            $this->warn("Memory usage high: " . round($currentMemory / 1024 / 1024, 2) . "MB");
+            Log::warning('High memory usage during sync', [
+                'current_mb' => round($currentMemory / 1024 / 1024, 2),
+                'max_mb' => $this->config['max_memory_mb']
+            ]);
         }
     }
 
-    protected function displayStats()
+    /**
+     * Log sync summary
+     *
+     * @param int $commandMetricsSynced
+     * @param int $jobMetricsSynced
+     * @return void
+     */
+    private function logSyncSummary(int $commandMetricsSynced, int $jobMetricsSynced): void
     {
-        $executionTime = round(microtime(true) - $this->startTime, 2);
-        $memoryUsage = round(memory_get_usage(true) / 1024 / 1024, 2);
+        $duration = microtime(true) - $this->startTime;
+        $memoryUsed = memory_get_usage(true) - $this->memoryStart;
 
-        $this->newLine();
-        $this->info('=== Sync Statistics ===');
-        $this->info("Execution time: {$executionTime} seconds");
-        $this->info("Memory usage: {$memoryUsage}MB");
-        $this->info("Commands synced: {$this->stats['commands_synced']}");
-        $this->info("Jobs synced: {$this->stats['jobs_synced']}");
-        $this->info("Errors: {$this->stats['errors']}");
-        $this->info("Warnings: {$this->stats['warnings']}");
+        $summary = [
+            'command_metrics_synced' => $commandMetricsSynced,
+            'job_metrics_synced' => $jobMetricsSynced,
+            'total_synced' => $commandMetricsSynced + $jobMetricsSynced,
+            'duration_seconds' => round($duration, 2),
+            'memory_used_mb' => round($memoryUsed / 1024 / 1024, 2),
+            'timestamp' => now()->toISOString()
+        ];
+
+        Log::info('Metrics sync completed', $summary);
+
+        $this->info('Sync Summary:');
+        $this->info("- Duration: " . round($duration, 2) . " seconds");
+        $this->info("- Memory used: " . round($memoryUsed / 1024 / 1024, 2) . "MB");
+        $this->info("- Total metrics synced: " . ($commandMetricsSynced + $jobMetricsSynced));
     }
 }

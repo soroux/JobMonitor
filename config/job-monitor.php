@@ -11,7 +11,7 @@ return [
     | The middleware to apply to the routes.
     | IMPORTANT: Protect these routes with auth middleware in production!
     */
-    'middleware' => ['api'],
+    'middleware' => ['api', 'throttle:60,1'],
 
     /*
     | Queues to Monitor
@@ -25,13 +25,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Redis Connection Name
+    | Redis Connection Configuration
     |--------------------------------------------------------------------------
     |
-    | Specify the Redis connection name to use for the job monitoring package.
+    | Specify the Redis connection configuration for the job monitoring package.
     |
     */
-    'monitor-connection' => env('JOB_MONITOR_REDIS_CONNECTION', 'default'),
+    'redis' => [
+        'connection' => env('JOB_MONITOR_REDIS_CONNECTION', 'default'),
+        'host' => env('JOB_MONITOR_REDIS_HOST', env('REDIS_HOST', '127.0.0.1')),
+        'password' => env('JOB_MONITOR_REDIS_PASSWORD', env('REDIS_PASSWORD', null)),
+        'port' => env('JOB_MONITOR_REDIS_PORT', env('REDIS_PORT', 6379)),
+        'database' => env('JOB_MONITOR_REDIS_DB', env('REDIS_DB', 0)),
+        'ssl' => env('JOB_MONITOR_REDIS_SSL', env('REDIS_SSL', false)),
+        'timeout' => env('JOB_MONITOR_REDIS_TIMEOUT', 5),
+        'retry_interval' => env('JOB_MONITOR_REDIS_RETRY_INTERVAL', 100),
+    ],
 
     /*
     |--------------------------------------------------------------------------
@@ -62,7 +71,14 @@ return [
         | Recommended: 3-5 frames for production
         */
         'frame_count' => 3,
+
+        /*
+        | Enable detailed error tracking
+        | Set to false in production to reduce log noise
+        */
+        'detailed_logging' => env('JOB_MONITOR_DETAILED_LOGGING', false),
     ],
+
     /*
     | Commands to Ignore
     |
@@ -85,6 +101,7 @@ return [
         'metrics:sync',
         'job-monitor:analyze',
         'schedule:run',
+        'migrate:fresh',
         null, // <-- Sometimes command is null (for tests or internal calls)
     ],
 
@@ -120,9 +137,12 @@ return [
     'analyze_mode' => [
         'enabled' => env('JOB_MONITOR_ANALYZE', true),
         'retention_days' => 7,
-        'performance_threshold' => 1.5, // 1.5x historical average
-        'failed_jobs_threshold' => 2.0, // 2x historical average failed jobs
-        'job_count_threshold' => 1.5, // 1.5x historical average job count
+        'performance_threshold' => 1.5, // 1.5x historical average (upper bound)
+        'performance_threshold_lower' => 0.5, // 0.5x historical average (lower bound)
+        'failed_jobs_threshold' => 2.0, // 2x historical average failed jobs (upper bound)
+        'failed_jobs_threshold_lower' => 0.1, // 0.1x historical average failed jobs (lower bound)
+        'job_count_threshold' => 1.5, // 1.5x historical average job count (upper bound)
+        'job_count_threshold_lower' => 0.5, // 0.5x historical average job count (lower bound)
         'analysis_interval_minutes' => 15, // How often to run analysis
         'schedule_analysis_enabled' => true, // Analyze scheduled commands
         'missed_execution_threshold_hours' => 2, // Hours to wait before considering a command as missed
@@ -143,29 +163,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Notification Configuration
-    |--------------------------------------------------------------------------
-    |
-    | Configure how anomalies are notified to your team.
-    |
-    */
-    'notifications' => [
-        'email' => [
-            'enabled' => env('JOB_MONITOR_EMAIL_NOTIFICATIONS', false),
-            'recipients' => [
-                // Add email addresses here
-                // 'admin@example.com',
-                // 'devops@example.com',
-            ],
-        ],
-        'slack' => [
-            'enabled' => env('JOB_MONITOR_SLACK_NOTIFICATIONS', false),
-            'webhook_url' => env('JOB_MONITOR_SLACK_WEBHOOK_URL'),
-        ],
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | Redis-to-Database Sync Configuration
     |--------------------------------------------------------------------------
     |
@@ -178,9 +175,53 @@ return [
         'batch_size' => env('JOB_MONITOR_SYNC_BATCH_SIZE', 500), // Batch size for database inserts
         'retry_attempts' => env('JOB_MONITOR_SYNC_RETRY_ATTEMPTS', 3), // Retry failed syncs
         'retry_delay_seconds' => env('JOB_MONITOR_SYNC_RETRY_DELAY', 30), // Delay between retries
-        'cleanup_enabled' => env('JOB_MONITOR_CLEANUP_ENABLED', true), // Clean up old Redis data
+        'cleanup_enabled' => env('JOB_MONITOR_CLEANUP_ENABLED', false), // Clean up old Redis data
         'cleanup_after_hours' => env('JOB_MONITOR_CLEANUP_AFTER_HOURS', 24), // Keep Redis data for X hours
         'max_memory_mb' => env('JOB_MONITOR_MAX_MEMORY_MB', 100), // Max memory usage for sync process
         'timeout_seconds' => env('JOB_MONITOR_SYNC_TIMEOUT', 300), // Max execution time for sync
+        'chunk_delay_ms' => env('JOB_MONITOR_CHUNK_DELAY_MS', 100), // Delay between chunks in milliseconds
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Health Check Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure health check endpoints and thresholds
+    |
+    */
+    'health_check' => [
+        'enabled' => env('JOB_MONITOR_HEALTH_CHECK_ENABLED', true),
+        'redis_timeout' => env('JOB_MONITOR_HEALTH_REDIS_TIMEOUT', 5),
+        'db_timeout' => env('JOB_MONITOR_HEALTH_DB_TIMEOUT', 5),
+        'max_metrics_age_hours' => env('JOB_MONITOR_MAX_METRICS_AGE_HOURS', 24),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Logging Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure logging channels and levels
+    |
+    */
+    'logging' => [
+        'channel' => env('JOB_MONITOR_LOG_CHANNEL', 'job-monitor'),
+        'level' => env('JOB_MONITOR_LOG_LEVEL', 'info'),
+        'structured' => env('JOB_MONITOR_STRUCTURED_LOGGING', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Rate Limiting Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure rate limiting for API endpoints
+    |
+    */
+    'rate_limiting' => [
+        'enabled' => env('JOB_MONITOR_RATE_LIMITING_ENABLED', true),
+        'requests_per_minute' => env('JOB_MONITOR_RATE_LIMIT_REQUESTS', 60),
+        'burst_limit' => env('JOB_MONITOR_RATE_LIMIT_BURST', 10),
     ],
 ];
